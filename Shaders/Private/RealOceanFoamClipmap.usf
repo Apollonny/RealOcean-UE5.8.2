@@ -1,0 +1,103 @@
+#include "/Plugin/RealOcean/RealOceanCommon.ush"
+#include "/Plugin/RealOcean/RealOceanWaves.ush"
+
+float RO_M28_BreakerSource(float2 RelativeXYCm)
+{
+    float3 displacementCm;
+    float3 normalWS;
+    float horizontalJacobian;
+
+    // Four macro bands cap the injection cost. The persistent field carries temporal detail;
+    // the material's analytic path remains responsible for higher-frequency crest detail.
+    RO_EvaluateOceanSpectrumRelativeBandsAnchored(
+        RelativeXYCm,
+        SwellDirectionDegrees,
+        WindDirectionDegrees,
+        SwellHsMeters,
+        WindSeaHsMeters,
+        SwellPeriodSeconds,
+        WindSeaPeakPeriodSeconds,
+        SwellDirectionalSpread,
+        WindSeaDirectionalSpread,
+        Steepness,
+        WindSeaSteepnessScale,
+        GravityMS2,
+        AnchorPhase0123,
+        AnchorPhase4567,
+        4,
+        displacementCm,
+        normalWS,
+        horizontalJacobian);
+
+    const float hs = max(CombinedHsMeters, 0.05);
+    const float crest = displacementCm.z * 0.01 / max(hs * 0.5, 0.025);
+    const float slope = length(normalWS.xy) / max(normalWS.z, 0.08);
+    const float compression = 1.0 - saturate(horizontalJacobian);
+    const float compMask = smoothstep(0.12, 0.42, compression);
+    const float crestMask = smoothstep(0.20, 0.72, crest);
+    const float slopeMask = smoothstep(0.18, 0.72, slope);
+    const float wind = saturate((WindSpeedMps - 3.5) / 11.5);
+    const float breaker = saturate(compMask * crestMask * lerp(0.45, 1.0, slopeMask) * lerp(0.35, 1.0, wind) * max(BreakingStrength, 0.0));
+
+    const float background = smoothstep(0.38, 0.82, crest)
+        * smoothstep(0.24, 0.78, slope)
+        * saturate((WindSpeedMps - 5.0) / 10.0) * 0.45;
+    return saturate(max(breaker, background) * max(WhitecapCoverageScale, 0.0));
+}
+
+float RO_M28_SampleHistory(float2 PreviousUV, float2 TexelUV)
+{
+    if (ResetHistory != 0 || any(PreviousUV < 0.0.xx) || any(PreviousUV > 1.0.xx))
+    {
+        return 0.0;
+    }
+
+    const float center = PreviousFoamTexture.SampleLevel(PreviousFoamSampler, PreviousUV, 0.0).r;
+    const float diffusionAlpha = saturate(max(DiffusionPerSecond, 0.0) * DeltaTimeSeconds);
+    if (diffusionAlpha <= 0.0)
+    {
+        return center;
+    }
+
+    const float neighborAverage = 0.25 * (
+        PreviousFoamTexture.SampleLevel(PreviousFoamSampler, PreviousUV + float2(TexelUV.x, 0.0), 0.0).r +
+        PreviousFoamTexture.SampleLevel(PreviousFoamSampler, PreviousUV - float2(TexelUV.x, 0.0), 0.0).r +
+        PreviousFoamTexture.SampleLevel(PreviousFoamSampler, PreviousUV + float2(0.0, TexelUV.y), 0.0).r +
+        PreviousFoamTexture.SampleLevel(PreviousFoamSampler, PreviousUV - float2(0.0, TexelUV.y), 0.0).r);
+    return lerp(center, neighborAverage, diffusionAlpha);
+}
+
+[numthreads(8, 8, 1)]
+void FoamClipmapCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint2 pixel = DispatchThreadId.xy;
+    if (pixel.x >= (uint)ClipmapExtent.x || pixel.y >= (uint)ClipmapExtent.y)
+    {
+        return;
+    }
+
+    const float2 extentF = max(float2(ClipmapExtent), 1.0.xx);
+    const float2 uv = (float2(pixel) + 0.5) / extentF;
+    const float2 localMeters = (uv - 0.5.xx) * max(CoverageMeters, 1.0);
+
+    // Semi-Lagrangian backtrace into the previous clipmap. CenterDelta reprojects camera/clipmap
+    // scrolling while AdvectionVelocity carries the foam through world space.
+    const float2 sourceRelativePreviousCenter = localMeters + CenterDeltaMeters - AdvectionVelocityMps * DeltaTimeSeconds;
+    const float2 previousUV = 0.5.xx + sourceRelativePreviousCenter / max(CoverageMeters, 1.0);
+    const float2 texelUV = rcp(extentF);
+    float history = RO_M28_SampleHistory(previousUV, texelUV);
+
+    const float decay = exp2(-DeltaTimeSeconds / max(FoamHalfLifeSeconds, 0.10));
+    history = saturate(history * decay);
+
+    // CurrentCenterOffsetMeters maps this texel back into the same camera-relative coordinate system
+    // used by the M25/M27 material waves and phase anchors.
+    const float2 relativeXYCm = (CurrentCenterOffsetMeters + localMeters) * 100.0;
+    const float source = RO_M28_BreakerSource(relativeXYCm);
+
+    // Convert the per-second source into a bounded frame contribution, then union densities so the
+    // update remains stable across variable frame rates and never exceeds one.
+    const float injected = 1.0 - exp2(-source * max(InjectionPerSecond, 0.0) * DeltaTimeSeconds * 1.44269504089);
+    const float density = saturate(1.0 - (1.0 - history) * (1.0 - injected));
+    OutputFoamTexture[pixel] = density;
+}

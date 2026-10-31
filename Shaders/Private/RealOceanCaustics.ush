@@ -1,0 +1,361 @@
+#ifndef REALOCEAN_CAUSTICS_USH
+#define REALOCEAN_CAUSTICS_USH
+
+#include "/Plugin/RealOcean/RealOceanWaves.ush"
+#include "/Plugin/RealOcean/RealOceanOptics.ush"
+
+float3 RO_RefractSunIntoWater(float3 SunDirectionToSourceWS, float3 SurfaceNormalWS, float AirIOR, float WaterIOR)
+{
+    const float3 incidentAirRay = -RO_SafeNormalize3(SunDirectionToSourceWS, float3(0.0, 0.0, 1.0));
+    const float3 N = RO_SafeNormalize3(SurfaceNormalWS, float3(0.0, 0.0, 1.0));
+    const float eta = max(AirIOR, RO_EPSILON) / max(WaterIOR, RO_EPSILON);
+    return RO_SafeNormalize3(refract(incidentAirRay, N, eta), float3(0.0, 0.0, -1.0));
+}
+
+float2 RO_ProjectSurfacePointToDepth(
+    float2 SurfaceRelativeXYMeters,
+    float3 SurfaceNormalWS,
+    float DepthMeters,
+    float3 SunDirectionToSourceWS,
+    float AirIOR,
+    float WaterIOR)
+{
+    const float3 R = RO_RefractSunIntoWater(SunDirectionToSourceWS, SurfaceNormalWS, AirIOR, WaterIOR);
+    const float down = max(-R.z, 0.05);
+    return SurfaceRelativeXYMeters + R.xy * (max(DepthMeters, 0.0) / down);
+}
+
+float3 RO_CausticWaveNormalAtMeters(
+    float2 RelativeSurfaceXYMeters,
+    float OceanTimeSeconds,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellSignificantWaveHeightMeters,
+    float WindSeaSignificantWaveHeightMeters,
+    float DominantSwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float DirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    int WaveBandCount)
+{
+    float3 normalWS;
+    // Normal-only production path: caustics never consumes Gerstner displacement, so avoid
+    // displacement accumulation in every inverse/Jacobian sample. Time already lives in anchors.
+    RO_EvaluateOceanSpectrumNormalRelativeBandsAnchored(
+        RelativeSurfaceXYMeters * 100.0,
+        SwellDirectionDegrees, WindDirectionDegrees,
+        SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters,
+        DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        DirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2,
+        AnchorPhase0123, AnchorPhase4567, WaveBandCount, normalWS);
+    return normalWS;
+}
+
+float2 RO_InvertReceiverToSurfaceXY(
+    float2 ReceiverRelativeXYMeters,
+    float DepthMeters,
+    float3 SunDirectionToSourceWS,
+    float AirIOR,
+    float WaterIOR,
+    float OceanTimeSeconds,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellSignificantWaveHeightMeters,
+    float WindSeaSignificantWaveHeightMeters,
+    float DominantSwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float DirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float ScreenFootprintMeters,
+    float SolveIterations,
+    float QualityMode,
+    int WaveBandCount)
+{
+    float2 S = ReceiverRelativeXYMeters;
+    const int iterations = RO_CausticSolveCountFromQuality(SolveIterations, QualityMode);
+
+    [unroll]
+    for (int i = 0; i < 3; ++i)
+    {
+        if (i >= iterations)
+        {
+            break;
+        }
+
+        const float3 N = RO_CausticWaveNormalAtMeters(
+            S, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees,
+            SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds,
+            WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness,
+            WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, WaveBandCount);
+
+        const float2 hit = RO_ProjectSurfacePointToDepth(
+            S, N, DepthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR);
+
+        // Damped fixed-point solve. Clamp each correction to prevent rare steep-wave divergence.
+        float2 correction = hit - ReceiverRelativeXYMeters;
+        const float maxStep = max(2.0, DepthMeters * 0.20);
+        const float correctionLength = length(correction);
+
+        // M14 convergence gate: once the inverse-solve residual is well below a pixel
+        // footprint, another expensive wave-normal/projection iteration cannot change
+        // the reconstructed image. Close-up views retain a 1 cm absolute tolerance.
+        const float convergenceTolerance = max(0.01, max(ScreenFootprintMeters, 0.0) * 0.35);
+        if (correctionLength <= convergenceTolerance)
+        {
+            break;
+        }
+
+        if (correctionLength > maxStep)
+        {
+            correction *= maxStep / max(correctionLength, RO_EPSILON);
+        }
+        S -= correction * 0.72;
+    }
+
+    return S;
+}
+
+float2 RO_CausticMapAtSurfaceXY(
+    float2 SurfaceRelativeXYMeters,
+    float DepthMeters,
+    float3 SunDirectionToSourceWS,
+    float AirIOR,
+    float WaterIOR,
+    float OceanTimeSeconds,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellSignificantWaveHeightMeters,
+    float WindSeaSignificantWaveHeightMeters,
+    float DominantSwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float DirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    int WaveBandCount)
+{
+    const float3 N = RO_CausticWaveNormalAtMeters(
+        SurfaceRelativeXYMeters, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees,
+        SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds,
+        WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness,
+        WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, WaveBandCount);
+
+    return RO_ProjectSurfacePointToDepth(
+        SurfaceRelativeXYMeters, N, DepthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR);
+}
+
+float RO_CausticJacobianFocus(
+    float2 SurfaceRelativeXYMeters,
+    float DepthMeters,
+    float3 SunDirectionToSourceWS,
+    float AirIOR,
+    float WaterIOR,
+    float OceanTimeSeconds,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellSignificantWaveHeightMeters,
+    float WindSeaSignificantWaveHeightMeters,
+    float DominantSwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float DirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float DerivativeStepMeters,
+    float ScreenFootprintMeters,
+    float ScreenSpaceStability,
+    float FocusClamp,
+    float DerivativeScale,
+    float QualityMode,
+    int WaveBandCount)
+{
+    float h = max(DerivativeStepMeters, 0.05) * max(DerivativeScale, 0.05);
+    h = max(h, max(ScreenFootprintMeters, 0.0) * max(ScreenSpaceStability, 0.0));
+
+    const float2 Ex = float2(h, 0.0);
+    const float2 Ey = float2(0.0, h);
+
+    const float2 FxP = RO_CausticMapAtSurfaceXY(SurfaceRelativeXYMeters + Ex, DepthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees, SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, WaveBandCount);
+    const float2 FyP = RO_CausticMapAtSurfaceXY(SurfaceRelativeXYMeters + Ey, DepthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees, SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, WaveBandCount);
+
+    float2 dFdx;
+    float2 dFdy;
+    const float resolvedQuality = RO_ResolveQualityMode(QualityMode);
+    if (resolvedQuality < 0.5)
+    {
+        // Performance: 3-point forward stencil (center + X + Y) instead of 4-point central differences.
+        const float2 F0 = RO_CausticMapAtSurfaceXY(SurfaceRelativeXYMeters, DepthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees, SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, WaveBandCount);
+        dFdx = (FxP - F0) / h;
+        dFdy = (FyP - F0) / h;
+    }
+    else
+    {
+        // Balanced/Cinematic: symmetric central differences reduce spatial bias and shimmer.
+        const float2 FxM = RO_CausticMapAtSurfaceXY(SurfaceRelativeXYMeters - Ex, DepthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees, SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, WaveBandCount);
+        const float2 FyM = RO_CausticMapAtSurfaceXY(SurfaceRelativeXYMeters - Ey, DepthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees, SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, WaveBandCount);
+        dFdx = (FxP - FxM) / (2.0 * h);
+        dFdy = (FyP - FyM) / (2.0 * h);
+    }
+    const float determinant = abs(dFdx.x * dFdy.y - dFdx.y * dFdy.x);
+    return clamp(rcp(max(determinant, 0.04)), 0.0, max(FocusClamp, 1.0));
+}
+
+int RO_CausticWaveBandCountForFootprint(
+    int QualityBandCount,
+    float ScreenFootprintMeters,
+    float BaseWavelengthMeters)
+{
+    // Receiver-space Nyquist guard. If a macro wavelength is smaller than roughly 2.25 pixels,
+    // its contribution cannot be stably reconstructed by the caustic Jacobian and is both costly
+    // and temporally noisy. Keep the longest two bands so the broad focusing field remains alive.
+    const float minResolvedWavelength = max(ScreenFootprintMeters, 0.0) * 2.25;
+    const float baseWavelength = max(BaseWavelengthMeters, 0.05);
+    int bands = clamp(QualityBandCount, 1, 8);
+
+    if (bands >= 8 && baseWavelength * 0.038 < minResolvedWavelength) bands = 7;
+    if (bands >= 7 && baseWavelength * 0.060 < minResolvedWavelength) bands = 6;
+    if (bands >= 6 && baseWavelength * 0.095 < minResolvedWavelength) bands = 5;
+    if (bands >= 5 && baseWavelength * 0.150 < minResolvedWavelength) bands = 4;
+    if (bands >= 4 && baseWavelength * 0.240 < minResolvedWavelength) bands = 3;
+    if (bands >= 3 && baseWavelength * 0.380 < minResolvedWavelength) bands = 2;
+
+    return max(bands, min(QualityBandCount, 2));
+}
+
+float4 RO_EvaluateWaveDerivedCaustics(
+    float3 ReceiverRelativeToCameraCm,
+    float ReceiverDepthMeters,
+    float3 SunDirectionToSourceWS,
+    float3 SunColor,
+    float SunRelativeIntensity,
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float SunCosZenithAir,
+    float AirIOR,
+    float WaterIOR,
+    float OceanTimeSeconds,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellSignificantWaveHeightMeters,
+    float WindSeaSignificantWaveHeightMeters,
+    float DominantSwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float DirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float EffectiveMaxDepthMeters,
+    float DerivativeStepMeters,
+    float ScreenSpaceStability,
+    float Contrast,
+    float FocusClamp,
+    float CausticsIntensity,
+    float SolveIterations,
+    float DerivativeScale,
+    float QualityMode)
+{
+#if RO_STATIC_CAUSTICS_ENABLED == 0
+    return 0.0.xxxx;
+#else
+    const float depthMeters = max(ReceiverDepthMeters, 0.0);
+    const float effectiveMaxDepth = max(EffectiveMaxDepthMeters, 0.0);
+    const float2 receiverXYMeters = ReceiverRelativeToCameraCm.xy * 0.01;
+    const float screenFootprintMeters = max(length(ddx(receiverXYMeters)), length(ddy(receiverXYMeters)));
+
+    if (depthMeters <= 0.0 || depthMeters >= effectiveMaxDepth || SunCosZenithAir <= 0.0 || CausticsIntensity <= 0.0)
+    {
+        return 0.0.xxxx;
+    }
+
+    const float envelope = RO_CausticsDepthEnvelope(depthMeters, effectiveMaxDepth);
+    // Use the mean interface only for the cheap pre-solve cull. The final contribution below is
+    // re-evaluated against the solved local wave facet so low-sun back-facing facets cannot emit
+    // unphysical bright caustics.
+    const float3 meanDirectSunRGB = max(SunColor, 0.0.xxx) * RO_SunRGBAtDepthRefracted(
+        AbsorptionPerMeter, ScatteringPerMeter, depthMeters, SunCosZenithAir, AirIOR, WaterIOR);
+
+    // Measurement-driven M12 gate: estimate the largest physically possible bright caustic
+    // contribution before running the expensive inverse solve/Jacobian path. The threshold is
+    // relative-linear radiance and deliberately tiny; it only rejects contributions that are
+    // already visually negligible after spectral water attenuation.
+    const float maxBrightDelta = max(max(FocusClamp, 1.0) - 1.0, 0.0) * max(Contrast, 0.0);
+    const float maxPotentialLuma = RO_RelativeLuminance(meanDirectSunRGB)
+        * max(SunRelativeIntensity, 0.0)
+        * max(CausticsIntensity, 0.0)
+        * envelope
+        * maxBrightDelta;
+    if (maxPotentialLuma < 1.0e-5)
+    {
+        return 0.0.xxxx;
+    }
+
+    const float resolvedQuality = RO_ResolveQualityMode(QualityMode);
+    const int qualityBandCount = RO_WaveBandCountFromQuality(resolvedQuality);
+    const float swellBaseWavelength = RO_DeepWaterWavelength(DominantSwellPeriodSeconds, GravityMS2);
+    const float windBaseWavelength = RO_DeepWaterWavelength(WindSeaPeakPeriodSeconds, GravityMS2);
+    const float baseWavelengthMeters = min(swellBaseWavelength, windBaseWavelength);
+    const int waveBandCount = RO_CausticWaveBandCountForFootprint(
+        qualityBandCount, screenFootprintMeters, baseWavelengthMeters);
+
+    const float2 surfaceXY = RO_InvertReceiverToSurfaceXY(
+        receiverXYMeters, depthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR,
+        OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees, SwellSignificantWaveHeightMeters,
+        WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        DirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale, GravityMS2,
+        AnchorPhase0123, AnchorPhase4567, screenFootprintMeters, SolveIterations, resolvedQuality, waveBandCount);
+
+    const float focus = RO_CausticJacobianFocus(
+        surfaceXY, depthMeters, SunDirectionToSourceWS, AirIOR, WaterIOR,
+        OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees, SwellSignificantWaveHeightMeters,
+        WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        DirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale, GravityMS2,
+        AnchorPhase0123, AnchorPhase4567, DerivativeStepMeters, screenFootprintMeters,
+        ScreenSpaceStability, FocusClamp, DerivativeScale, resolvedQuality, waveBandCount);
+
+    const float focusMultiplier = max(0.0, 1.0 + (focus - 1.0) * max(Contrast, 0.0));
+    const float brightDelta = max(focusMultiplier - 1.0, 0.0);
+    float3 additiveRGB = 0.0.xxx;
+    if (brightDelta > 1.0e-5)
+    {
+        // Only pay the extra final normal evaluation where the Jacobian actually creates a bright
+        // caustic. The local facet then controls both Fresnel entry loss and the refracted water path.
+        const float3 sourceNormalWS = RO_CausticWaveNormalAtMeters(
+            surfaceXY, OceanTimeSeconds, SwellDirectionDegrees, WindDirectionDegrees,
+            SwellSignificantWaveHeightMeters, WindSeaSignificantWaveHeightMeters, DominantSwellPeriodSeconds,
+            WindSeaPeakPeriodSeconds, DirectionalSpread, WindSeaDirectionalSpread, Steepness,
+            WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, waveBandCount);
+        float localInterfaceTransmission;
+        float localSunDownCosine;
+        const float3 localDirectSunRGB = max(SunColor, 0.0.xxx) * RO_SunRGBAtDepthLocalSurface(
+            AbsorptionPerMeter, ScatteringPerMeter, depthMeters, SunDirectionToSourceWS, sourceNormalWS,
+            AirIOR, WaterIOR, localInterfaceTransmission, localSunDownCosine);
+        additiveRGB = localDirectSunRGB * max(SunRelativeIntensity, 0.0)
+            * brightDelta * envelope * max(CausticsIntensity, 0.0);
+    }
+
+    return float4(additiveRGB, lerp(1.0, focusMultiplier, envelope));
+
+#endif
+}
+
+#endif

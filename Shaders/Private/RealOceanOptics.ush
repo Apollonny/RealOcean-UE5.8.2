@@ -1,0 +1,501 @@
+#ifndef REALOCEAN_OPTICS_USH
+#define REALOCEAN_OPTICS_USH
+
+#include "/Plugin/RealOcean/RealOceanCommon.ush"
+
+// Convention: distances are meters; optical coefficients are inverse meters; colors are linear RGB.
+
+// 0.33.5 turbidity response. Turbidity is a dimensionless artistic/physical control rather than a
+// claim of direct NTU calibration. 0.10 is the historical clear-open-ocean reference and therefore
+// returns the authored base coefficients exactly. Values below 0.10 reduce particulate scattering;
+// larger values add a bounded, weakly spectral particulate absorption/scattering term. Keeping the
+// mapping in this shared include lets SingleLayerWater, underwater volume, caustics and CPU mirrors
+// follow one response curve.
+void RO_ApplyTurbidityToOpticalCoefficientsM35(
+    float3 BaseAbsorptionPerMeter,
+    float3 BaseScatteringPerMeter,
+    float Turbidity,
+    out float3 EffectiveAbsorptionPerMeter,
+    out float3 EffectiveScatteringPerMeter)
+{
+    const float referenceTurbidity = 0.10;
+    const float t = max(Turbidity, 0.0);
+    const float clearRatio = saturate(t / referenceTurbidity);
+    const float clearAbsorptionScale = lerp(0.92, 1.0, clearRatio);
+    const float clearScatteringScale = lerp(0.35, 1.0, clearRatio);
+
+    // Log growth remains visually expressive from 0.1 -> 1.0 without exploding at the exposed 5.0 max.
+    const float particulate = log2(1.0 + 1.5 * max(t - referenceTurbidity, 0.0));
+    const float3 particulateAbsorption = float3(0.012, 0.009, 0.006) * particulate;
+    const float3 particulateScattering = float3(0.050, 0.060, 0.070) * particulate;
+
+    EffectiveAbsorptionPerMeter = max(BaseAbsorptionPerMeter, 0.0.xxx) * clearAbsorptionScale + particulateAbsorption;
+    EffectiveScatteringPerMeter = max(BaseScatteringPerMeter, 0.0.xxx) * clearScatteringScale + particulateScattering;
+}
+
+
+// 0.32.4 underwater-sun helpers. The volume and caustic paths use the same mean-interface
+// refraction/Fresnel model so low-sun glow, direct transmission and receiver caustics agree.
+float RO_InterfaceFresnelUnpolarized(float CosIncident, float IncidentIOR, float TransmittedIOR)
+{
+    const float n1 = max(IncidentIOR, RO_EPSILON);
+    const float n2 = max(TransmittedIOR, RO_EPSILON);
+    const float ci = saturate(abs(CosIncident));
+    const float eta = n1 / n2;
+    const float sinT2 = eta * eta * max(0.0, 1.0 - ci * ci);
+    if (sinT2 >= 1.0)
+    {
+        return 1.0;
+    }
+    const float ct = sqrt(max(0.0, 1.0 - sinT2));
+    const float rs = (n1 * ci - n2 * ct) / max(n1 * ci + n2 * ct, RO_EPSILON);
+    const float rp = (n2 * ci - n1 * ct) / max(n2 * ci + n1 * ct, RO_EPSILON);
+    return saturate(0.5 * (rs * rs + rp * rp));
+}
+
+float RO_SunInterfaceTransmissionAirToWater(float SunCosZenithAir, float AirIOR, float WaterIOR)
+{
+    if (SunCosZenithAir <= 0.0)
+    {
+        return 0.0;
+    }
+    return 1.0 - RO_InterfaceFresnelUnpolarized(saturate(SunCosZenithAir), AirIOR, WaterIOR);
+}
+
+// M34 canonical directional-light refraction. All underwater solar paths use this helper so the
+// volumetric halo, visible underside sun window and caustic transport cannot drift into subtly
+// different Snell/Fresnel conventions. The returned direction is the physical ray travelling from
+// air into water (normally downward); InterfaceTransmissionOut is the unpolarized Fresnel entry term.
+float3 RO_RefractDirectionalLightAirToWater(
+    float3 SunDirectionToSourceWS,
+    float3 SurfaceNormalWS,
+    float AirIOR,
+    float WaterIOR,
+    out float InterfaceTransmissionOut)
+{
+    const float3 Lair = RO_SafeNormalize3(SunDirectionToSourceWS, float3(0.0, 0.0, 1.0));
+    const float3 N = RO_SafeNormalize3(SurfaceNormalWS, float3(0.0, 0.0, 1.0));
+    InterfaceTransmissionOut = 0.0;
+
+    const float noL = dot(N, Lair);
+    if (Lair.z <= 0.0 || noL <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    const float eta = max(AirIOR, RO_EPSILON) / max(WaterIOR, RO_EPSILON);
+    const float3 Traw = refract(-Lair, N, eta);
+    const float len2 = dot(Traw, Traw);
+    if (len2 <= 1.0e-8)
+    {
+        return 0.0.xxx;
+    }
+
+    InterfaceTransmissionOut = 1.0 - RO_InterfaceFresnelUnpolarized(noL, AirIOR, WaterIOR);
+    return Traw * rsqrt(len2);
+}
+
+float3 RO_RefractedSunDirectionToSourceWater(
+    float3 SunDirectionToSourceWS,
+    float AirIOR,
+    float WaterIOR)
+{
+    float interfaceTransmission;
+    const float3 Tdown = RO_RefractDirectionalLightAirToWater(
+        SunDirectionToSourceWS, float3(0.0, 0.0, 1.0), AirIOR, WaterIOR, interfaceTransmission);
+    if (dot(Tdown, Tdown) <= 1.0e-8 || interfaceTransmission <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+    return -Tdown;
+}
+
+// 0.32.4 local-interface helpers. Mean-interface transmission is still useful for the global
+// underwater state, but visible sun-window rays and caustics must use the resolved wave facet.
+// At low solar elevation, facets facing away from the sun receive no direct solar energy.
+float RO_SunInterfaceTransmissionAirToWaterLocal(
+    float3 SunDirectionToSourceWS,
+    float3 SurfaceNormalWS,
+    float AirIOR,
+    float WaterIOR)
+{
+    const float3 Lair = RO_SafeNormalize3(SunDirectionToSourceWS, float3(0.0, 0.0, 1.0));
+    const float3 N = RO_SafeNormalize3(SurfaceNormalWS, float3(0.0, 0.0, 1.0));
+    const float noL = dot(N, Lair);
+    if (Lair.z <= 0.0 || noL <= 0.0)
+    {
+        return 0.0;
+    }
+    return 1.0 - RO_InterfaceFresnelUnpolarized(noL, AirIOR, WaterIOR);
+}
+
+float3 RO_RefractSunIntoWaterLocal(
+    float3 SunDirectionToSourceWS,
+    float3 SurfaceNormalWS,
+    float AirIOR,
+    float WaterIOR,
+    out float InterfaceTransmissionOut,
+    out float DownwardCosineOut)
+{
+    InterfaceTransmissionOut = 0.0;
+    DownwardCosineOut = 0.0;
+    const float3 Tdown = RO_RefractDirectionalLightAirToWater(
+        SunDirectionToSourceWS, SurfaceNormalWS, AirIOR, WaterIOR, InterfaceTransmissionOut);
+    if (dot(Tdown, Tdown) <= 1.0e-8 || InterfaceTransmissionOut <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    const float down = -Tdown.z;
+    // A refracted ray that no longer travels into world-space water cannot illuminate an
+    // underwater receiver. Reject it instead of clamping its path into a huge unstable projection.
+    if (down <= 1.0e-3)
+    {
+        return 0.0.xxx;
+    }
+
+    DownwardCosineOut = down;
+    return Tdown;
+}
+
+float3 RO_SunRGBAtDepthLocalSurface(
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float DepthMeters,
+    float3 SunDirectionToSourceWS,
+    float3 SurfaceNormalWS,
+    float AirIOR,
+    float WaterIOR,
+    out float InterfaceTransmissionOut,
+    out float DownwardCosineOut)
+{
+    const float3 Tdown = RO_RefractSunIntoWaterLocal(
+        SunDirectionToSourceWS, SurfaceNormalWS, AirIOR, WaterIOR,
+        InterfaceTransmissionOut, DownwardCosineOut);
+    if (dot(Tdown, Tdown) <= 1.0e-8 || InterfaceTransmissionOut <= 0.0 || DownwardCosineOut <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    const float pathMeters = max(DepthMeters, 0.0) / max(DownwardCosineOut, 1.0e-3);
+    const float3 extinction = max(AbsorptionPerMeter + ScatteringPerMeter, 0.0.xxx);
+    return RO_ExpNeg3(extinction * pathMeters) * InterfaceTransmissionOut;
+}
+
+float3 RO_BeerLambert(float3 CoefficientPerMeter, float DistanceMeters)
+{
+    return RO_ExpNeg3(max(CoefficientPerMeter, 0.0.xxx) * max(DistanceMeters, 0.0));
+}
+
+float3 RO_ExtinctionTransmission(float3 AbsorptionPerMeter, float3 ScatteringPerMeter, float DistanceMeters)
+{
+    const float3 extinction = max(AbsorptionPerMeter + ScatteringPerMeter, 0.0.xxx);
+    return RO_ExpNeg3(extinction * max(DistanceMeters, 0.0));
+}
+
+float3 RO_SingleScatteringAlbedo(float3 AbsorptionPerMeter, float3 ScatteringPerMeter)
+{
+    const float3 A = max(AbsorptionPerMeter, 0.0.xxx);
+    const float3 S = max(ScatteringPerMeter, 0.0.xxx);
+    const float3 extinction = A + S;
+    return S / max(extinction, RO_EPSILON.xxx);
+}
+
+float3 RO_ApplyHomogeneousWater(
+    float3 SceneRadiance,
+    float3 WaterInscatterColor,
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float DistanceMeters,
+    float InscatterIntensity)
+{
+    const float3 T = RO_ExtinctionTransmission(AbsorptionPerMeter, ScatteringPerMeter, DistanceMeters);
+    const float3 albedo = RO_SingleScatteringAlbedo(AbsorptionPerMeter, ScatteringPerMeter);
+    const float3 source = max(WaterInscatterColor, 0.0.xxx) * albedo * max(InscatterIntensity, 0.0);
+    return SceneRadiance * T + source * (1.0.xxx - T);
+}
+
+float RO_HenyeyGreenstein(float CosTheta, float G)
+{
+    const float g = clamp(G, -0.98, 0.98);
+    const float gg = g * g;
+    const float denom = max(1.0 + gg - 2.0 * g * clamp(CosTheta, -1.0, 1.0), 1.0e-4);
+    // denom^(3/2) without a generic pow() keeps the SM6 path simple and predictable.
+    const float denomPow15 = denom * sqrt(denom);
+    return (1.0 - gg) / (4.0 * RO_PI * denomPow15);
+}
+
+float RO_RefractedSunCosineWater(float SunCosZenithAir, float AirIOR, float WaterIOR)
+{
+    const float muAir = saturate(SunCosZenithAir);
+    if (muAir <= 0.0)
+    {
+        return 0.0;
+    }
+
+    const float eta = max(AirIOR, RO_EPSILON) / max(WaterIOR, RO_EPSILON);
+    const float sinAir2 = max(0.0, 1.0 - muAir * muAir);
+    const float sinWater2 = saturate(eta * eta * sinAir2);
+    return sqrt(max(0.0, 1.0 - sinWater2));
+}
+
+float RO_DirectSunPathMeters(float DepthMeters, float SunCosZenithAir, float AirIOR, float WaterIOR)
+{
+    if (DepthMeters <= 0.0)
+    {
+        return 0.0;
+    }
+
+    const float muWater = RO_RefractedSunCosineWater(SunCosZenithAir, AirIOR, WaterIOR);
+    if (muWater <= 1.0e-5)
+    {
+        return 1.0e9;
+    }
+
+    return max(DepthMeters, 0.0) / muWater;
+}
+
+float3 RO_SunRGBAtDepthRefracted(
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float DepthMeters,
+    float SunCosZenithAir,
+    float AirIOR,
+    float WaterIOR)
+{
+    if (SunCosZenithAir <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    const float pathMeters = RO_DirectSunPathMeters(DepthMeters, SunCosZenithAir, AirIOR, WaterIOR);
+    const float interfaceTransmission = RO_SunInterfaceTransmissionAirToWater(
+        SunCosZenithAir, AirIOR, WaterIOR);
+    return RO_ExtinctionTransmission(AbsorptionPerMeter, ScatteringPerMeter, pathMeters)
+        * interfaceTransmission;
+}
+
+// Exact depth-average of direct-sun transmission for a homogeneous water column and a fixed
+// refracted sun angle. This replaces the M9 1/2/3-point quality sampling path with an analytic
+// integral: average(exp(-a*d), d0..d1). It is both more accurate and cheaper for Cinematic mode.
+float3 RO_AverageSunTransmissionAlongSegmentAnalytic(
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float CameraDepthMeters,
+    float PixelDepthMeters,
+    float SunCosZenithAir,
+    float AirIOR,
+    float WaterIOR)
+{
+    if (SunCosZenithAir <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    const float muWater = RO_RefractedSunCosineWater(SunCosZenithAir, AirIOR, WaterIOR);
+    if (muWater <= 1.0e-5)
+    {
+        return 0.0.xxx;
+    }
+
+    const float d0 = max(CameraDepthMeters, 0.0);
+    const float d1 = max(PixelDepthMeters, 0.0);
+    const float depthMin = min(d0, d1);
+    const float depthMax = max(d0, d1);
+    const float deltaDepth = depthMax - depthMin;
+
+    const float3 extinction = max(AbsorptionPerMeter + ScatteringPerMeter, 0.0.xxx);
+    const float3 ratePerDepth = extinction / max(muWater, 1.0e-5);
+    const float depthMid = 0.5 * (depthMin + depthMax);
+    const float3 midpoint = RO_ExpNeg3(ratePerDepth * depthMid);
+
+    const float interfaceTransmission = RO_SunInterfaceTransmissionAirToWater(
+        SunCosZenithAir, AirIOR, WaterIOR);
+
+    if (deltaDepth <= 1.0e-4)
+    {
+        return midpoint * interfaceTransmission;
+    }
+
+    const float3 T0 = RO_ExpNeg3(ratePerDepth * depthMin);
+    const float3 tauSpan = ratePerDepth * deltaDepth;
+
+    // Exact identity:
+    // average(exp(-a*d), d0..d1) = exp(-a*d0) * (1-exp(-a*Delta))/(a*Delta).
+    // The phi_1 helper uses a short Taylor series near zero, avoiding T0-T1 cancellation
+    // while also preserving the continuous zero-extinction limit exactly.
+    const float3 exactAverage = T0 * RO_OneMinusExpNegOverX3(tauSpan);
+    return saturate(exactAverage * interfaceTransmission);
+}
+
+
+// Conservative upper bound for direct-sun transmission at or below a depth.
+// Uses the least-extinct spectral channel, so if this bound is tiny then every RGB
+// channel is tiny. This is used only to skip directional-sun work that is already
+// below a visually negligible threshold; ambient water scattering remains active.
+float RO_DirectSunTransmissionUpperBoundAtDepth(
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float DepthMeters,
+    float SunCosZenithAir,
+    float AirIOR,
+    float WaterIOR)
+{
+    if (SunCosZenithAir <= 0.0)
+    {
+        return 0.0;
+    }
+
+    const float muWater = RO_RefractedSunCosineWater(SunCosZenithAir, AirIOR, WaterIOR);
+    if (muWater <= 1.0e-5)
+    {
+        return 0.0;
+    }
+
+    const float3 extinction = max(AbsorptionPerMeter + ScatteringPerMeter, 0.0.xxx);
+    const float minExtinction = min(extinction.x, min(extinction.y, extinction.z));
+    const float tauLowerBound = minExtinction * max(DepthMeters, 0.0) / muWater;
+    return RO_ExpNeg(tauLowerBound);
+}
+
+// Same analytic segment average as RO_AverageSunTransmissionAlongSegmentAnalytic,
+// with a conservative deep-water fast path. If even the least-extinct channel at the
+// shallow end of the segment is below the threshold, all directional sun terms can
+// safely be treated as zero for this segment.
+float3 RO_AverageSunTransmissionAlongSegmentCulled(
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float CameraDepthMeters,
+    float PixelDepthMeters,
+    float SunCosZenithAir,
+    float AirIOR,
+    float WaterIOR)
+{
+    const float shallowDepth = max(min(CameraDepthMeters, PixelDepthMeters), 0.0);
+    const float upperBound = RO_DirectSunTransmissionUpperBoundAtDepth(
+        AbsorptionPerMeter, ScatteringPerMeter, shallowDepth,
+        SunCosZenithAir, AirIOR, WaterIOR);
+
+    if (upperBound < 1.0e-7)
+    {
+        return 0.0.xxx;
+    }
+
+    return RO_AverageSunTransmissionAlongSegmentAnalytic(
+        AbsorptionPerMeter, ScatteringPerMeter, CameraDepthMeters, PixelDepthMeters,
+        SunCosZenithAir, AirIOR, WaterIOR);
+}
+
+// M9-compatible signature. QualityMode is kept so existing Custom nodes continue to compile;
+// M10's homogeneous-medium solution is analytic and therefore no longer quality sampled.
+float3 RO_AverageSunTransmissionAlongSegment(
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float CameraDepthMeters,
+    float PixelDepthMeters,
+    float SunCosZenithAir,
+    float AirIOR,
+    float WaterIOR,
+    float QualityMode)
+{
+    return RO_AverageSunTransmissionAlongSegmentCulled(
+        AbsorptionPerMeter,
+        ScatteringPerMeter,
+        CameraDepthMeters,
+        PixelDepthMeters,
+        SunCosZenithAir,
+        AirIOR,
+        WaterIOR);
+}
+
+// Single-scattering approximation. Stable for very long rays because all exponentials are bounded
+// by RO_ExpNeg3; no NaNs/denormals at the 3000 m project depth.
+float3 RO_ApplyDirectionalSunScatteringRefracted(
+    float3 SceneRadiance,
+    float3 WaterInscatterColor,
+    float3 SunColor,
+    float3 AverageSunTransmissionRGB,
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float DistanceMeters,
+    float InscatterIntensity,
+    float3 ViewRayFromCameraWS,
+    float3 SunDirectionToSourceWS,
+    float AirIOR,
+    float WaterIOR,
+    float ForwardScatteringG,
+    float DirectionalSunScale)
+{
+    const float3 T = RO_ExtinctionTransmission(AbsorptionPerMeter, ScatteringPerMeter, DistanceMeters);
+    const float3 albedo = RO_SingleScatteringAlbedo(AbsorptionPerMeter, ScatteringPerMeter);
+
+    const float3 ambientSource = max(WaterInscatterColor, 0.0.xxx)
+        * albedo
+        * max(InscatterIntensity, 0.0);
+
+    float3 directionalSource = 0.0.xxx;
+    const float directPotential = RO_RelativeLuminance(max(AverageSunTransmissionRGB, 0.0.xxx))
+        * max(DirectionalSunScale, 0.0);
+
+    // Avoid view/sun normalization + HG sqrt work in deep water where the directional
+    // contribution is already many orders of magnitude below the ambient medium term.
+    if (directPotential >= 1.0e-7)
+    {
+        const float3 V = RO_SafeNormalize3(ViewRayFromCameraWS, float3(0.0, 0.0, 1.0));
+        // The solar direction seen inside water is NOT the air-space DirectionalLight direction.
+        // Use Snell-refraction at the mean interface so low-sun forward scattering appears inside
+        // Snell's window rather than incorrectly hugging the geometric horizon.
+        const float3 toSunWater = RO_RefractedSunDirectionToSourceWater(
+            SunDirectionToSourceWS, AirIOR, WaterIOR);
+        const float cosTheta = clamp(dot(V, toSunWater), -1.0, 1.0);
+        const float phaseGain = RO_HenyeyGreenstein(cosTheta, ForwardScatteringG) * (4.0 * RO_PI);
+
+        directionalSource = max(SunColor, 0.0.xxx)
+            * saturate(AverageSunTransmissionRGB)
+            * albedo
+            * max(phaseGain, 0.0)
+            * max(DirectionalSunScale, 0.0);
+    }
+
+    return SceneRadiance * T + (ambientSource + directionalSource) * (1.0.xxx - T);
+}
+
+// Source-compatible legacy helper. New underwater material code should call the refracted variant
+// with the configured IORs, but external snippets that still use the old signature remain valid.
+float3 RO_ApplyDirectionalSunScattering(
+    float3 SceneRadiance,
+    float3 WaterInscatterColor,
+    float3 SunColor,
+    float3 AverageSunTransmissionRGB,
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float DistanceMeters,
+    float InscatterIntensity,
+    float3 ViewRayFromCameraWS,
+    float3 SunDirectionToSourceWS,
+    float ForwardScatteringG,
+    float DirectionalSunScale)
+{
+    return RO_ApplyDirectionalSunScatteringRefracted(
+        SceneRadiance, WaterInscatterColor, SunColor, AverageSunTransmissionRGB,
+        AbsorptionPerMeter, ScatteringPerMeter, DistanceMeters, InscatterIntensity,
+        ViewRayFromCameraWS, SunDirectionToSourceWS, 1.00029, 1.333,
+        ForwardScatteringG, DirectionalSunScale);
+}
+
+float RO_Smooth01(float X)
+{
+    const float t = saturate(X);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float RO_CausticsDepthEnvelope(float DepthMeters, float MaxDepthMeters)
+{
+    if (MaxDepthMeters <= 0.0 || DepthMeters < 0.0)
+    {
+        return 0.0;
+    }
+    return 1.0 - RO_Smooth01(DepthMeters / MaxDepthMeters);
+}
+
+#endif

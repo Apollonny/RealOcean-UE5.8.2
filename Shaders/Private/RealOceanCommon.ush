@@ -1,0 +1,128 @@
+#ifndef REALOCEAN_COMMON_USH
+#define REALOCEAN_COMMON_USH
+
+// 0.33.5 retains shader API 19 / MPC contract 12 while adding visual-only turbidity, glitter and foam polish.
+// Custom-node snippets and shared includes must match these values.
+#define REALOCEAN_SHADER_API_VERSION 19
+#define REALOCEAN_MPC_CONTRACT_VERSION 12
+
+static const float RO_PI = 3.14159265359;
+static const float RO_TWO_PI = 6.28318530718;
+static const float RO_EPSILON = 1.0e-6;
+
+// Optional compile-time quality override for Custom Expressions.
+// Set RO_STATIC_QUALITY_MODE through the Custom node's Additional Defines:
+//   0 = Performance, 1 = Balanced, 2 = Cinematic, 255 = runtime RO_QualityMode.
+#ifndef RO_STATIC_QUALITY_MODE
+#define RO_STATIC_QUALITY_MODE 255
+#endif
+
+// Compile-time feature switches for Material Statistics / target-hardware A/B variants.
+// They default to the shipping/full feature path and require no new MPC parameters.
+#ifndef RO_STATIC_MICRO_WAVES_ENABLED
+#define RO_STATIC_MICRO_WAVES_ENABLED 1
+#endif
+
+#ifndef RO_STATIC_CAUSTICS_ENABLED
+#define RO_STATIC_CAUSTICS_ENABLED 1
+#endif
+
+// M27: deterministic multi-age analytic foam memory. Runtime-gated to Cinematic quality.
+// Set to 0 in a surface Custom node Additional Define to strip all historical foam evaluations.
+#ifndef RO_STATIC_ANALYTIC_FOAM_HISTORY_ENABLED
+#define RO_STATIC_ANALYTIC_FOAM_HISTORY_ENABLED 1
+#endif
+
+float3 RO_SafeNormalize3(float3 V, float3 Fallback)
+{
+    const float L2 = dot(V, V);
+    return (L2 > RO_EPSILON) ? V * rsqrt(L2) : Fallback;
+}
+
+float2 RO_SafeNormalize2(float2 V, float2 Fallback)
+{
+    const float L2 = dot(V, V);
+    return (L2 > RO_EPSILON) ? V * rsqrt(L2) : Fallback;
+}
+
+// Stable e^-x for optical depths. Values past ~80 are visually zero in float and clamping
+// avoids denormal/underflow work on long 3000 m paths.
+float RO_ExpNeg(float X)
+{
+    return exp(-clamp(X, 0.0, 80.0));
+}
+
+float3 RO_ExpNeg3(float3 X)
+{
+    return exp(-clamp(X, 0.0.xxx, 80.0.xxx));
+}
+
+
+// Stable phi_1(x) = (1 - exp(-x)) / x for x >= 0.
+// The series avoids cancellation when optical depth is tiny.
+float RO_OneMinusExpNegOverX(float X)
+{
+    const float x = max(X, 0.0);
+    if (x < 1.0e-3)
+    {
+        const float x2 = x * x;
+        return 1.0 - 0.5 * x + (1.0 / 6.0) * x2 - (1.0 / 24.0) * x2 * x;
+    }
+    return (1.0 - RO_ExpNeg(x)) / max(x, RO_EPSILON);
+}
+
+float3 RO_OneMinusExpNegOverX3(float3 X)
+{
+    return float3(
+        RO_OneMinusExpNegOverX(X.x),
+        RO_OneMinusExpNegOverX(X.y),
+        RO_OneMinusExpNegOverX(X.z));
+}
+
+float RO_RelativeLuminance(float3 LinearRGB)
+{
+    const float3 c = max(LinearRGB, 0.0.xxx);
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+float RO_ResolveQualityMode(float RuntimeQualityMode)
+{
+#if RO_STATIC_QUALITY_MODE == 0
+    return 0.0;
+#elif RO_STATIC_QUALITY_MODE == 1
+    return 1.0;
+#elif RO_STATIC_QUALITY_MODE == 2
+    return 2.0;
+#else
+    return clamp(RuntimeQualityMode, 0.0, 2.0);
+#endif
+}
+
+int RO_WaveBandCountFromQuality(float QualityMode)
+{
+    const float Q = RO_ResolveQualityMode(QualityMode);
+    // ERealOceanQualityMode: Performance=0, Balanced=1, Cinematic=2.
+    return (Q < 0.5) ? 4 : ((Q < 1.5) ? 6 : 8);
+}
+
+int RO_MicroBandCountFromQuality(float QualityMode)
+{
+    const float Q = RO_ResolveQualityMode(QualityMode);
+    return (Q < 0.5) ? 2 : ((Q < 1.5) ? 3 : 4);
+}
+
+int RO_CausticSolveCountFromQuality(float RuntimeSolveIterations, float QualityMode)
+{
+#if RO_STATIC_QUALITY_MODE == 0
+    return 1;
+#elif RO_STATIC_QUALITY_MODE == 1
+    return 2;
+#elif RO_STATIC_QUALITY_MODE == 2
+    return 3;
+#else
+    // Runtime mode preserves the CPU-resolved budget but clamps the shader loop contract.
+    return clamp((int)round(RuntimeSolveIterations), 1, 3);
+#endif
+}
+
+#endif

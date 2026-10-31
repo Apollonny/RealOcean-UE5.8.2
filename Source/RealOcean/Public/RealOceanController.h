@@ -1,0 +1,194 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "RealOceanTypes.h"
+#include "RealOceanNetworkProtocol.h"
+#include "RealOceanController.generated.h"
+
+class UMaterialParameterCollection;
+class UMaterialInterface;
+class UMaterialInstanceDynamic;
+class AWaterBody;
+class AWaterZone;
+class URealOceanPostProcessComponent;
+class ADirectionalLight;
+class URealOceanWaterProfile;
+class ULocalPlayer;
+struct FPropertyChangedEvent;
+struct FLifetimeProperty;
+
+USTRUCT()
+struct FRealOceanNetworkClockSync
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    uint16 ProtocolVersion = RealOceanNetworkProtocol::SnapshotProtocolVersion;
+
+    UPROPERTY()
+    uint16 SettingsSchemaVersion = RealOceanNetworkProtocol::SettingsSchemaVersion;
+
+    UPROPERTY()
+    double ServerEpochSeconds = 0.0;
+
+    UPROPERTY()
+    double WaveTimeAtEpochSeconds = 0.0;
+
+    UPROPERTY()
+    double TurbulenceTimeAtEpochSeconds = 0.0;
+
+    UPROPERTY()
+    double WaveTimeScale = 1.0;
+
+    UPROPERTY()
+    double TurbulenceTimeScale = 1.0;
+
+    // Authoritative resolved settings snapshot for this epoch. Replicated only when ApplySettings
+    // advances the revision, not per-frame, so clients/JIP peers cannot use a different spectrum.
+    UPROPERTY()
+    FRealOceanSettings EffectiveSettings;
+
+    UPROPERTY()
+    uint32 Revision = 0;
+
+    bool IsCompatible() const
+    {
+        return ProtocolVersion == RealOceanNetworkProtocol::SnapshotProtocolVersion
+            && SettingsSchemaVersion == RealOceanNetworkProtocol::SettingsSchemaVersion;
+    }
+};
+
+UCLASS(BlueprintType, Blueprintable)
+class REALOCEAN_API ARealOceanController : public AActor
+{
+    GENERATED_BODY()
+
+public:
+    ARealOceanController();
+
+    virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
+    UFUNCTION(BlueprintCallable, Category = "Real Ocean")
+    void ApplySettings();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Real Ocean|Validation")
+    void ValidateSetup();
+
+    UFUNCTION(BlueprintCallable, Category = "Real Ocean")
+    void TrackActor(AActor* ActorToTrack);
+
+    UFUNCTION(BlueprintPure, Category = "Real Ocean")
+    FRealOceanState GetOceanState() const;
+
+    UFUNCTION(BlueprintCallable, Category = "Real Ocean|Environment")
+    FRealOceanEnvironmentSample QueryEnvironmentAtWorldPosition(FVector WorldPositionCm) const;
+
+    // Reproducible non-shipping A/B capture variants. Full is the normal production path.
+    UFUNCTION(BlueprintCallable, Category = "Real Ocean|Profiling")
+    void SetProfilingVariant(ERealOceanProfilingVariant Variant);
+
+    UFUNCTION(BlueprintCallable, Category = "Real Ocean|Profiling")
+    void ClearProfilingVariant();
+
+    UFUNCTION(BlueprintPure, Category = "Real Ocean|Profiling")
+    ERealOceanProfilingVariant GetProfilingVariant() const { return ProfilingVariant; }
+
+    // Internal turnkey bootstrap marker. Set before BeginPlay on authority-created fallback controllers.
+    void MarkAsTurnkeyAutoController() { bIsTurnkeyAutoController = true; }
+    bool IsTurnkeyAutoController() const { return bIsTurnkeyAutoController; }
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean")
+    FRealOceanSettings OceanSettings;
+
+    // Optional optical-only profile. It never changes the fixed 3000 m physical depth contract.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Profile")
+    TObjectPtr<URealOceanWaterProfile> WaterProfile = nullptr;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Validation")
+    bool bValidateOnBeginPlay = true;
+
+    // Transient measurement aid. Shipping builds force Full.
+    UPROPERTY(Transient, VisibleAnywhere, BlueprintReadOnly, Category = "Real Ocean|Profiling")
+    ERealOceanProfilingVariant ProfilingVariant = ERealOceanProfilingVariant::Full;
+
+    // Bind the scene's sun. Its forward vector is the direction in which light is emitted;
+    // RealOcean internally uses the opposite vector as "direction to source".
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Lighting")
+    TObjectPtr<ADirectionalLight> SunDirectionalLight = nullptr;
+
+    // Unbound post-process host. Assign M_PP_RealOceanVolume to its UnderwaterPostProcessMaterial property.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Real Ocean")
+    TObjectPtr<URealOceanPostProcessComponent> UnderwaterPostProcess;
+
+    // Turnkey installs resolve this generated asset automatically. Manual assignment remains supported.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean")
+    TObjectPtr<UMaterialParameterCollection> GlobalParameterCollection = nullptr;
+
+    // Surface material generated by RealOceanEditor. Automatically assigned to the active WaterBodyOcean.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Turnkey")
+    TObjectPtr<UMaterialInterface> OceanSurfaceMaterial = nullptr;
+
+    // Loads generated MPC/material/post-process assets and discovers the scene sun when fields are unassigned.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Turnkey")
+    bool bAutoResolveTurnkeyAssets = true;
+
+    // Automatically assigns the generated RealOcean material to the active UE Water ocean.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Turnkey")
+    bool bAutoBindOceanSurfaceMaterial = true;
+
+    // If the level has no WaterZone/WaterBodyOcean, create a runtime fallback pair so a blank map can Play immediately.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Turnkey")
+    bool bAutoCreateWaterWorldWhenMissing = true;
+
+    // Horizontal coverage of the fallback WaterZone/Ocean created for blank-map turnkey startup.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Real Ocean|Turnkey", meta=(ClampMin="1000.0", ClampMax="100000.0"))
+    double TurnkeyOceanExtentMeters = 10000.0;
+
+private:
+    UPROPERTY(Replicated)
+    bool bIsTurnkeyAutoController = false;
+
+    UPROPERTY(ReplicatedUsing=OnRep_NetworkClockSync)
+    FRealOceanNetworkClockSync NetworkClockSync;
+
+    UFUNCTION()
+    void OnRep_NetworkClockSync();
+
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInstanceDynamic> TurnkeyOceanMID = nullptr;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInterface> OriginalOceanSurfaceMaterial = nullptr;
+
+    TWeakObjectPtr<AWaterBody> TurnkeyBoundOcean;
+    TWeakObjectPtr<AWaterBody> TurnkeyAutoCreatedOcean;
+    TWeakObjectPtr<AWaterZone> TurnkeyAutoCreatedWaterZone;
+    bool bCapturedOriginalOceanMaterial = false;
+    bool bTurnkeyAssetsReady = false;
+    bool bWarnedNetworkProtocolMismatch = false;
+    bool bDeferredBeginPlayForClockSync = false;
+    FDelegateHandle LocalPlayerAddedHandle;
+    FDelegateHandle LocalPlayerRemovedHandle;
+
+    bool ResolveTurnkeyDefaults();
+    void RetireAutoControllerForExplicitHandoff();
+    void UpdateAuthoritativeNetworkClock(const FRealOceanSettings& EffectiveSettings, class URealOceanSubsystem* OceanSubsystem);
+    void ApplyNetworkClockToSubsystem(class URealOceanSubsystem* OceanSubsystem) const;
+    double ResolveServerWorldTimeSeconds() const;
+    bool IsNetworkedWorld() const;
+    void RegisterLocalPlayerLifecycleDelegates();
+    void UnregisterLocalPlayerLifecycleDelegates();
+    void HandleLocalPlayerTopologyChanged(ULocalPlayer* LocalPlayer);
+    void RefreshLocalRenderStateOnly();
+    ADirectionalLight* DiscoverPreferredSunLight() const;
+    AWaterBody* EnsureTurnkeyOceanBody();
+    void BindTurnkeyOceanSurface();
+    void RestoreTurnkeyOceanSurface();
+    void CleanupTurnkeyRuntimeArtifacts();
+};

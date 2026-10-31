@@ -1,0 +1,327 @@
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
+#include "/Plugin/RealOcean/RealOceanCaustics.ush"
+
+float2 RO_M16_FullPixelFromHalfSv(float2 HalfSv)
+{
+    const float2 halfExtent = max(float2((FullExtent + 1) / 2), 1.0.xx);
+    const float2 uv = saturate(HalfSv / halfExtent);
+    return float2(FullViewRectMin) + uv * float2(FullViewRectSize);
+}
+
+float RO_M16_LoadDeviceZ(int2 Pixel)
+{
+    const int2 P = clamp(Pixel, int2(0, 0), FullExtent - 1);
+    return SceneTexturesStruct_SceneDepthTexture.Load(int3(P, 0)).r;
+}
+
+float3 RO_M16_ReconstructCameraRelativeCm(float2 FullPixel, float DeviceZ)
+{
+    // SvPositionToTranslatedWorld expects render-target pixel coordinates plus device Z.
+    // Subtract the translated camera origin so the result remains LWC-safe in float.
+    const float3 translatedWorld = SvPositionToTranslatedWorld(float4(FullPixel, DeviceZ, 1.0));
+    return translatedWorld - View.TranslatedWorldCameraOrigin;
+}
+
+float RO_M16_ReceiverDepthMeters(float3 CameraRelativeCm)
+{
+    return CameraDepthMeters - CameraRelativeCm.z * 0.01;
+}
+
+float4 HalfResCausticsPS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+    const float2 fullPixel = RO_M16_FullPixelFromHalfSv(SvPosition.xy);
+    const int2 pixelI = int2(fullPixel);
+    const float deviceZ = RO_M16_LoadDeviceZ(pixelI);
+
+    // Reversed-Z far/background. No physical receiver => no caustic contribution.
+    if (deviceZ <= 1.0e-7)
+    {
+        return float4(0.0, 0.0, 0.0, -1.0);
+    }
+
+    const float3 receiverRelativeCm = RO_M16_ReconstructCameraRelativeCm(fullPixel, deviceZ);
+    const float receiverDepthMeters = RO_M16_ReceiverDepthMeters(receiverRelativeCm);
+
+    if (receiverDepthMeters <= 0.0 || receiverDepthMeters >= EffectiveMaxDepthMeters)
+    {
+        return float4(0.0, 0.0, 0.0, receiverDepthMeters);
+    }
+
+    const float4 caustics = RO_EvaluateWaveDerivedCaustics(
+        receiverRelativeCm,
+        receiverDepthMeters,
+        SunDirectionToSourceWS,
+        SunColor,
+        SunRelativeIntensity,
+        AbsorptionPerMeter,
+        ScatteringPerMeter,
+        SunCosZenithAir,
+        AirIOR,
+        WaterIOR,
+        OceanTimeSeconds,
+        TravelDirectionDegrees,
+        WindDirectionDegrees,
+        SwellSignificantWaveHeightMeters,
+        WindSeaSignificantWaveHeightMeters,
+        DominantSwellPeriodSeconds,
+        WindSeaPeakPeriodSeconds,
+        DirectionalSpread,
+        WindSeaDirectionalSpread,
+        Steepness,
+        WindSeaSteepnessScale,
+        GravityMS2,
+        AnchorPhase0123,
+        AnchorPhase4567,
+        EffectiveMaxDepthMeters,
+        DerivativeStepMeters,
+        ScreenSpaceStability,
+        Contrast,
+        FocusClamp,
+        CausticsIntensity,
+        SolveIterations,
+        DerivativeScale,
+        QualityMode);
+
+    // RGB = additive physical caustic radiance. A = receiver water-column depth for bilateral upscale.
+    return float4(max(caustics.rgb, 0.0.xxx), receiverDepthMeters);
+}
+
+
+float2 RO_M18_ClipToViewUV(float4 Clip)
+{
+    const float invW = rcp(max(abs(Clip.w), 1.0e-6));
+    const float2 ndc = Clip.xy * invW;
+    return float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+float2 RO_M18_CameraPreviousViewUV(float2 FullPixel, float DeviceZ, out float PreviousClipW)
+{
+    const float3 translatedWorld = SvPositionToTranslatedWorld(float4(FullPixel, DeviceZ, 1.0));
+    const float4 currentClip = mul(float4(translatedWorld, 1.0), View.TranslatedWorldToClip);
+    const float4 previousClip = mul(currentClip, View.ClipToPrevClip);
+    PreviousClipW = previousClip.w;
+    return RO_M18_ClipToViewUV(previousClip);
+}
+
+float2 RO_M18_ReprojectToPreviousViewUV(
+    float2 FullPixel,
+    float DeviceZ,
+    out float MotionPixels,
+    out float ObjectMotionPixels,
+    out float UsedSceneVelocity,
+    out float Valid)
+{
+    const float2 currentViewUV = saturate((FullPixel - float2(FullViewRectMin)) / max(float2(FullViewRectSize), 1.0.xx));
+
+    float previousClipW = 0.0;
+    const float2 cameraPreviousViewUV = RO_M18_CameraPreviousViewUV(FullPixel, DeviceZ, previousClipW);
+    float2 previousViewUV = cameraPreviousViewUV;
+    UsedSceneVelocity = 0.0;
+    ObjectMotionPixels = 0.0;
+
+    // UE velocity pixels encode CurrentScreenPos - PreviousScreenPos. A cleared velocity texel has x==0,
+    // which means static geometry can safely fall back to depth + ClipToPrevClip camera reprojection.
+    if (SceneVelocityEnabled != 0)
+    {
+        const int2 P = clamp(int2(FullPixel), int2(0, 0), FullExtent - 1);
+        const float4 encodedVelocity = SceneTexturesStruct_GBufferVelocityTexture.Load(int3(P, 0));
+        if (encodedVelocity.x > 0.0)
+        {
+            const float2 screenVelocity = DecodeVelocityFromTexture(encodedVelocity).xy;
+            const float2 currentScreenPos = ViewportUVToScreenPos(currentViewUV);
+            const float2 previousScreenPos = currentScreenPos - screenVelocity;
+            const float2 velocityPreviousViewUV = ScreenPosToViewportUV(previousScreenPos);
+
+            if (all(velocityPreviousViewUV >= 0.0.xx) && all(velocityPreviousViewUV <= 1.0.xx))
+            {
+                previousViewUV = velocityPreviousViewUV;
+                UsedSceneVelocity = 1.0;
+                // Relative object motion versus camera-only reprojection. This is used only as a
+                // conservative history-confidence reduction; the velocity path itself performs the reprojection.
+                ObjectMotionPixels = length((velocityPreviousViewUV - cameraPreviousViewUV) * float2(FullViewRectSize));
+            }
+        }
+    }
+
+    MotionPixels = length((previousViewUV - currentViewUV) * float2(FullViewRectSize));
+    const bool inBounds = all(previousViewUV >= 0.0.xx) && all(previousViewUV <= 1.0.xx);
+    const bool projectionValid = (UsedSceneVelocity > 0.5) || (previousClipW > 1.0e-6);
+    Valid = (projectionValid && inBounds && View.CameraCut < 0.5) ? 1.0 : 0.0;
+    return previousViewUV;
+}
+
+void RO_M17_CurrentNeighborhood(int2 P, out float3 MinC, out float3 MaxC)
+{
+    const int2 maxP = HalfExtent - 1;
+    const int2 pC = clamp(P, int2(0, 0), maxP);
+    const int2 pL = clamp(P + int2(-1, 0), int2(0, 0), maxP);
+    const int2 pR = clamp(P + int2( 1, 0), int2(0, 0), maxP);
+    const int2 pU = clamp(P + int2( 0,-1), int2(0, 0), maxP);
+    const int2 pD = clamp(P + int2( 0, 1), int2(0, 0), maxP);
+
+    const float3 cC = CurrentCausticsTexture.Load(int3(pC, 0)).rgb;
+    const float3 cL = CurrentCausticsTexture.Load(int3(pL, 0)).rgb;
+    const float3 cR = CurrentCausticsTexture.Load(int3(pR, 0)).rgb;
+    const float3 cU = CurrentCausticsTexture.Load(int3(pU, 0)).rgb;
+    const float3 cD = CurrentCausticsTexture.Load(int3(pD, 0)).rgb;
+
+    MinC = min(cC, min(min(cL, cR), min(cU, cD)));
+    MaxC = max(cC, max(max(cL, cR), max(cU, cD)));
+}
+
+float4 TemporalResolvePS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+    const int2 halfPixel = clamp(int2(SvPosition.xy), int2(0, 0), HalfExtent - 1);
+    const float4 current = CurrentCausticsTexture.Load(int3(halfPixel, 0));
+
+    if (HistoryValid == 0 || current.a < 0.0)
+    {
+        return current;
+    }
+
+    const float2 halfExtentF = max(float2(HalfExtent), 1.0.xx);
+    const float2 halfUV = (float2(halfPixel) + 0.5) / halfExtentF;
+    const float2 fullPixel = float2(FullViewRectMin) + halfUV * float2(FullViewRectSize);
+    const float deviceZ = RO_M16_LoadDeviceZ(int2(fullPixel));
+
+    if (deviceZ <= 1.0e-7)
+    {
+        return current;
+    }
+
+    float motionPixels = 0.0;
+    float objectMotionPixels = 0.0;
+    float usedSceneVelocity = 0.0;
+    float reprojectionValid = 0.0;
+    const float2 previousViewUV = RO_M18_ReprojectToPreviousViewUV(
+        fullPixel,
+        deviceZ,
+        motionPixels,
+        objectMotionPixels,
+        usedSceneVelocity,
+        reprojectionValid);
+    if (reprojectionValid < 0.5)
+    {
+        return current;
+    }
+
+    const float4 history = HistoryCausticsTexture.SampleLevel(HistorySampler, previousViewUV, 0.0);
+    if (history.a < 0.0)
+    {
+        return current;
+    }
+
+    const float depthDelta = abs(history.a - current.a);
+    float depthConfidence = saturate(1.0 - depthDelta / max(HistoryDepthRejectMeters, 1.0e-4));
+    depthConfidence *= depthConfidence;
+
+    float motionConfidence = saturate(1.0 - motionPixels / max(HistoryMotionRejectPixels, 1.0));
+    motionConfidence *= motionConfidence;
+
+    float objectMotionConfidence = 1.0;
+    if (usedSceneVelocity > 0.5)
+    {
+        objectMotionConfidence = saturate(1.0 - objectMotionPixels / max(ObjectVelocityRejectPixels, 1.0));
+        objectMotionConfidence *= objectMotionConfidence;
+    }
+
+    float3 localMin, localMax;
+    RO_M17_CurrentNeighborhood(halfPixel, localMin, localMax);
+    const float3 localRange = max(localMax - localMin, 1.0e-5.xxx);
+    const float3 expansion = localRange * max(HistoryClampExpansion, 0.0);
+    const float3 clippedHistory = clamp(history.rgb, localMin - expansion, localMax + expansion);
+
+    // M34: scene/depth reprojection alone cannot track a caustic pattern that moves because the
+    // wave phase or sun direction changed. CPU supplies a global pattern confidence for this view,
+    // while a local radiance disagreement gate rejects stale bright streaks that neighborhood
+    // clipping alone can otherwise drag for several frames.
+    const float currentLuma = dot(max(current.rgb, 0.0.xxx), float3(0.2126, 0.7152, 0.0722));
+    const float historyLuma = dot(max(history.rgb, 0.0.xxx), float3(0.2126, 0.7152, 0.0722));
+    const float radianceDeltaRatio = abs(historyLuma - currentLuma)
+        / max(max(historyLuma, currentLuma), 1.0e-4);
+    float radianceConfidence = saturate(1.0 - radianceDeltaRatio / max(HistoryRadianceRejectRatio, 0.05));
+    radianceConfidence *= radianceConfidence;
+
+    const float confidence = depthConfidence
+        * motionConfidence
+        * objectMotionConfidence
+        * saturate(PatternHistoryConfidence)
+        * radianceConfidence;
+    const float blendWeight = saturate(HistoryWeight) * confidence;
+    const float3 resolved = lerp(current.rgb, clippedHistory, blendWeight);
+
+    // Keep current receiver depth authoritative; only RGB radiance is accumulated.
+    return float4(max(resolved, 0.0.xxx), current.a);
+}
+
+float RO_M16_BilateralWeight(float SampleDepth, float CenterDepth, float BilinearWeight)
+{
+    if (SampleDepth < 0.0 || CenterDepth < 0.0)
+    {
+        return 0.0;
+    }
+    const float depthDelta = abs(SampleDepth - CenterDepth);
+    return BilinearWeight * exp2(-depthDelta * max(DepthSharpness, 0.0));
+}
+
+float3 RO_M16_UpsampleCaustics(float2 FullPixel, float CenterDepth)
+{
+    const float2 localUv = saturate((FullPixel - float2(FullViewRectMin)) / max(float2(FullViewRectSize), 1.0.xx));
+    const float2 halfCoord = localUv * float2(HalfExtent) - 0.5;
+    const int2 baseCoord = int2(floor(halfCoord));
+    const float2 f = frac(halfCoord);
+
+    const int2 maxCoord = HalfExtent - 1;
+    const int2 p00 = clamp(baseCoord + int2(0, 0), int2(0, 0), maxCoord);
+    const int2 p10 = clamp(baseCoord + int2(1, 0), int2(0, 0), maxCoord);
+    const int2 p01 = clamp(baseCoord + int2(0, 1), int2(0, 0), maxCoord);
+    const int2 p11 = clamp(baseCoord + int2(1, 1), int2(0, 0), maxCoord);
+
+    const float4 c00 = HalfResCausticsTexture.Load(int3(p00, 0));
+    const float4 c10 = HalfResCausticsTexture.Load(int3(p10, 0));
+    const float4 c01 = HalfResCausticsTexture.Load(int3(p01, 0));
+    const float4 c11 = HalfResCausticsTexture.Load(int3(p11, 0));
+
+    const float w00 = RO_M16_BilateralWeight(c00.a, CenterDepth, (1.0 - f.x) * (1.0 - f.y));
+    const float w10 = RO_M16_BilateralWeight(c10.a, CenterDepth, f.x * (1.0 - f.y));
+    const float w01 = RO_M16_BilateralWeight(c01.a, CenterDepth, (1.0 - f.x) * f.y);
+    const float w11 = RO_M16_BilateralWeight(c11.a, CenterDepth, f.x * f.y);
+    const float weightSum = w00 + w10 + w01 + w11;
+
+    if (weightSum <= 1.0e-6)
+    {
+        // Edge fallback: nearest half-res value. Avoids black seams when every neighbor is across a depth discontinuity.
+        const int2 nearestP = clamp(int2(round(halfCoord)), int2(0, 0), maxCoord);
+        return max(HalfResCausticsTexture.Load(int3(nearestP, 0)).rgb, 0.0.xxx);
+    }
+
+    return max((c00.rgb * w00 + c10.rgb * w10 + c01.rgb * w01 + c11.rgb * w11) / weightSum, 0.0.xxx);
+}
+
+float4 CompositeCausticsPS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+    const int2 pixelI = clamp(int2(SvPosition.xy), int2(0, 0), FullExtent - 1);
+    const float4 scene = SceneColorTexture.Load(int3(pixelI, 0));
+    const float deviceZ = RO_M16_LoadDeviceZ(pixelI);
+
+    if (deviceZ <= 1.0e-7)
+    {
+        return (VisualizeOnly != 0) ? float4(0.0, 0.0, 0.0, 1.0) : scene;
+    }
+
+    const float3 receiverRelativeCm = RO_M16_ReconstructCameraRelativeCm(SvPosition.xy, deviceZ);
+    const float receiverDepthMeters = RO_M16_ReceiverDepthMeters(receiverRelativeCm);
+    const float3 caustics = RO_M16_UpsampleCaustics(SvPosition.xy, receiverDepthMeters);
+
+    if (VisualizeOnly != 0)
+    {
+        // Bounded debug visualization while retaining HDR-order information.
+        return float4(1.0.xxx - exp(-caustics), 1.0);
+    }
+
+    // This pass executes BeforeDOF in pre-exposed HDR scene color. Convert the physical additive
+    // term into the same pre-exposed domain before composition.
+    const float3 composed = scene.rgb + caustics * max(CompositeStrength, 0.0) * max(PreExposure, 0.0);
+    return float4(composed, scene.a);
+}

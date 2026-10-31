@@ -1,0 +1,486 @@
+#ifndef REALOCEAN_WAVES_USH
+#define REALOCEAN_WAVES_USH
+
+#include "/Plugin/RealOcean/RealOceanCommon.ush"
+
+float RO_DeepWaterWavelength(float PeriodSeconds, float GravityMS2)
+{
+    const float T = max(PeriodSeconds, 0.01);
+    return max(GravityMS2, 0.01) * T * T / RO_TWO_PI;
+}
+
+void RO_GetDualSpectrumBandParameters(
+    int BandIndex,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    out float2 Direction,
+    out float K,
+    out float Amplitude,
+    out float HorizontalAmplitude,
+    out float PhaseOffset)
+{
+    float lengthScale;
+    float amplitudeWeight;
+    float directionOffset;
+    float baseDirection;
+    float spread;
+    float baseWavelength;
+    float hs;
+    float q;
+    float hsAmplitudeScale;
+
+    if (BandIndex < 3)
+    {
+        const float3 lengthScaleS = float3(1.000, 0.660, 0.430);
+        const float3 amplitudeS = float3(0.500, 0.310, 0.190);
+        const float3 directionS = float3(0.0, 6.0, -9.0);
+        const float3 phaseS = float3(0.37, 1.14, 2.21);
+        lengthScale = lengthScaleS[BandIndex];
+        amplitudeWeight = amplitudeS[BandIndex];
+        directionOffset = directionS[BandIndex];
+        PhaseOffset = phaseS[BandIndex];
+        baseDirection = SwellDirectionDegrees;
+        spread = saturate(SwellDirectionalSpread);
+        baseWavelength = RO_DeepWaterWavelength(SwellPeriodSeconds, GravityMS2);
+        hs = max(SwellHsMeters, 0.0);
+        q = clamp(Steepness, 0.0, 0.95);
+        hsAmplitudeScale = 0.571886264; // Normalizes fixed swell weights to Hs = 4*sigma.
+    }
+    else
+    {
+        const int W = BandIndex - 3;
+        const float windLength[5] = {1.000, 0.680, 0.460, 0.300, 0.190};
+        const float windAmp[5] = {0.340, 0.250, 0.180, 0.140, 0.090};
+        const float windDir[5] = {-12.0, 8.0, -24.0, 31.0, -43.0};
+        const float windPhase[5] = {0.79, 2.87, 1.73, 0.19, 2.48};
+        lengthScale = windLength[W];
+        amplitudeWeight = windAmp[W];
+        directionOffset = windDir[W];
+        PhaseOffset = windPhase[W];
+        baseDirection = WindDirectionDegrees;
+        spread = saturate(WindSeaDirectionalSpread);
+        baseWavelength = RO_DeepWaterWavelength(WindSeaPeakPeriodSeconds, GravityMS2);
+        hs = max(WindSeaHsMeters, 0.0);
+        q = clamp(Steepness * max(WindSeaSteepnessScale, 0.0), 0.0, 0.95);
+        hsAmplitudeScale = 0.724409485; // Normalizes fixed wind-sea weights to Hs = 4*sigma.
+    }
+
+    const float wavelength = max(0.05, baseWavelength * lengthScale);
+    K = RO_TWO_PI / wavelength;
+    Amplitude = hs * hsAmplitudeScale * amplitudeWeight;
+    HorizontalAmplitude = q * Amplitude;
+
+    const float directionRad = radians(baseDirection + directionOffset * spread);
+    float sDir;
+    float cDir;
+    sincos(directionRad, sDir, cDir);
+    Direction = float2(cDir, sDir);
+}
+
+void RO_AddDualSpectrumBandFull(
+    int BandIndex,
+    float2 RelativeXYMeters,
+    float AnchorPhase,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    inout float3 DisplacementMeters,
+    inout float3 TangentX,
+    inout float3 TangentY)
+{
+    float2 D; float k; float amplitude; float horizontalAmplitude; float phaseOffset;
+    RO_GetDualSpectrumBandParameters(BandIndex, SwellDirectionDegrees, WindDirectionDegrees,
+        SwellHsMeters, WindSeaHsMeters, SwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        SwellDirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale,
+        GravityMS2, D, k, amplitude, horizontalAmplitude, phaseOffset);
+
+    const float phase = AnchorPhase + k * dot(D, RelativeXYMeters) + phaseOffset;
+    float s; float c; sincos(phase, s, c);
+    DisplacementMeters.xy += D * (horizontalAmplitude * c);
+    DisplacementMeters.z += amplitude * s;
+
+    const float commonH = horizontalAmplitude * k * s;
+    const float commonV = amplitude * k * c;
+    TangentX += float3(-D.x * D.x * commonH, -D.x * D.y * commonH, D.x * commonV);
+    TangentY += float3(-D.x * D.y * commonH, -D.y * D.y * commonH, D.y * commonV);
+}
+
+void RO_AddDualSpectrumBandDisplacement(
+    int BandIndex, float2 RelativeXYMeters, float AnchorPhase,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    inout float3 DisplacementMeters)
+{
+    float2 D; float k; float amplitude; float horizontalAmplitude; float phaseOffset;
+    RO_GetDualSpectrumBandParameters(BandIndex, SwellDirectionDegrees, WindDirectionDegrees,
+        SwellHsMeters, WindSeaHsMeters, SwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        SwellDirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale,
+        GravityMS2, D, k, amplitude, horizontalAmplitude, phaseOffset);
+    const float phase = AnchorPhase + k * dot(D, RelativeXYMeters) + phaseOffset;
+    float s; float c; sincos(phase, s, c);
+    DisplacementMeters.xy += D * (horizontalAmplitude * c);
+    DisplacementMeters.z += amplitude * s;
+}
+
+void RO_AddDualSpectrumBandDerivatives(
+    int BandIndex, float2 RelativeXYMeters, float AnchorPhase,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    inout float3 TangentX, inout float3 TangentY)
+{
+    float2 D; float k; float amplitude; float horizontalAmplitude; float phaseOffset;
+    RO_GetDualSpectrumBandParameters(BandIndex, SwellDirectionDegrees, WindDirectionDegrees,
+        SwellHsMeters, WindSeaHsMeters, SwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        SwellDirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale,
+        GravityMS2, D, k, amplitude, horizontalAmplitude, phaseOffset);
+    const float phase = AnchorPhase + k * dot(D, RelativeXYMeters) + phaseOffset;
+    float s; float c; sincos(phase, s, c);
+    const float commonH = horizontalAmplitude * k * s;
+    const float commonV = amplitude * k * c;
+    TangentX += float3(-D.x * D.x * commonH, -D.x * D.y * commonH, D.x * commonV);
+    TangentY += float3(-D.x * D.y * commonH, -D.y * D.y * commonH, D.y * commonV);
+}
+
+// Evaluate a deterministic look-back state from the current phase anchors. This is used by the
+// optional analytic foam-retention path without allocating a history render target.
+void RO_EvaluateOceanSpectrumHistoricalRelativeBandsAnchored(
+    float2 RelativeXYCm,
+    float HistoryAgeSeconds,
+    float2 AdvectionVelocityMetersPerSecond,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    int BandCount,
+    out float3 DisplacementCm,
+    out float3 NormalWS,
+    out float HorizontalJacobian)
+{
+    const float age = max(HistoryAgeSeconds, 0.0);
+    const float2 xy = RelativeXYCm * 0.01 - AdvectionVelocityMetersPerSecond * age;
+    const int bands = clamp(BandCount, 1, 8);
+    float3 displacementM = 0.0.xxx;
+    float3 tx = float3(1.0, 0.0, 0.0);
+    float3 ty = float3(0.0, 1.0, 0.0);
+
+    [unroll]
+    for (int i = 0; i < 8; ++i)
+    {
+        if (i >= bands) break;
+        float2 D; float k; float amplitude; float horizontalAmplitude; float phaseOffset;
+        RO_GetDualSpectrumBandParameters(i, SwellDirectionDegrees, WindDirectionDegrees,
+            SwellHsMeters, WindSeaHsMeters, SwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+            SwellDirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale,
+            GravityMS2, D, k, amplitude, horizontalAmplitude, phaseOffset);
+        const float omega = sqrt(max(GravityMS2, 0.01) * k);
+        const float anchor = (i < 4) ? AnchorPhase0123[i] : AnchorPhase4567[i - 4];
+        const float phase = anchor + omega * age + k * dot(D, xy) + phaseOffset;
+        float sn; float cs; sincos(phase, sn, cs);
+
+        displacementM.xy += D * (horizontalAmplitude * cs);
+        displacementM.z += amplitude * sn;
+        const float commonH = horizontalAmplitude * k * sn;
+        const float commonV = amplitude * k * cs;
+        tx += float3(-D.x * D.x * commonH, -D.x * D.y * commonH, D.x * commonV);
+        ty += float3(-D.x * D.y * commonH, -D.y * D.y * commonH, D.y * commonV);
+    }
+
+    DisplacementCm = displacementM * 100.0;
+    HorizontalJacobian = tx.x * ty.y - tx.y * ty.x;
+    NormalWS = RO_SafeNormalize3(cross(tx, ty), float3(0.0, 0.0, 1.0));
+    if (NormalWS.z < 0.0) NormalWS = -NormalWS;
+}
+
+float RO_GetAnchorPhase(int Index, float4 P0123, float4 P4567)
+{
+    return (Index < 4) ? P0123[Index] : P4567[Index - 4];
+}
+
+void RO_EvaluateOceanSpectrumRelativeBandsAnchored(
+    float2 RelativeXYCm,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    int BandCount,
+    out float3 DisplacementCm,
+    out float3 NormalWS,
+    out float HorizontalJacobian)
+{
+    const float2 xy = RelativeXYCm * 0.01;
+    const int bands = clamp(BandCount, 1, 8);
+    float3 displacementM = 0.0.xxx;
+    float3 tx = float3(1.0,0.0,0.0);
+    float3 ty = float3(0.0,1.0,0.0);
+    [unroll] for (int i=0;i<8;++i)
+    {
+        if (i>=bands) break;
+        RO_AddDualSpectrumBandFull(i, xy, RO_GetAnchorPhase(i, AnchorPhase0123, AnchorPhase4567),
+            SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+            SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+            Steepness, WindSeaSteepnessScale, GravityMS2, displacementM, tx, ty);
+    }
+    DisplacementCm = displacementM * 100.0;
+    HorizontalJacobian = tx.x * ty.y - tx.y * ty.x;
+    NormalWS = RO_SafeNormalize3(cross(tx, ty), float3(0.0,0.0,1.0));
+    if (NormalWS.z < 0.0) NormalWS = -NormalWS;
+}
+
+void RO_EvaluateOceanSpectrumDisplacementRelativeBandsAnchored(
+    float2 RelativeXYCm,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    float4 AnchorPhase0123, float4 AnchorPhase4567, int BandCount,
+    out float3 DisplacementCm)
+{
+    const float2 xy = RelativeXYCm * 0.01;
+    const int bands = clamp(BandCount,1,8);
+    float3 d=0.0.xxx;
+    [unroll] for(int i=0;i<8;++i)
+    {
+        if(i>=bands) break;
+        RO_AddDualSpectrumBandDisplacement(i,xy,RO_GetAnchorPhase(i,AnchorPhase0123,AnchorPhase4567),
+            SwellDirectionDegrees,WindDirectionDegrees,SwellHsMeters,WindSeaHsMeters,SwellPeriodSeconds,
+            WindSeaPeakPeriodSeconds,SwellDirectionalSpread,WindSeaDirectionalSpread,Steepness,
+            WindSeaSteepnessScale,GravityMS2,d);
+    }
+    DisplacementCm=d*100.0;
+}
+
+void RO_EvaluateOceanSpectrumNormalRelativeBandsAnchored(
+    float2 RelativeXYCm,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    float4 AnchorPhase0123, float4 AnchorPhase4567, int BandCount,
+    out float3 NormalWS)
+{
+    const float2 xy=RelativeXYCm*0.01;
+    const int bands=clamp(BandCount,1,8);
+    float3 tx=float3(1,0,0), ty=float3(0,1,0);
+    [unroll] for(int i=0;i<8;++i)
+    {
+        if(i>=bands) break;
+        RO_AddDualSpectrumBandDerivatives(i,xy,RO_GetAnchorPhase(i,AnchorPhase0123,AnchorPhase4567),
+            SwellDirectionDegrees,WindDirectionDegrees,SwellHsMeters,WindSeaHsMeters,SwellPeriodSeconds,
+            WindSeaPeakPeriodSeconds,SwellDirectionalSpread,WindSeaDirectionalSpread,Steepness,
+            WindSeaSteepnessScale,GravityMS2,tx,ty);
+    }
+    NormalWS=RO_SafeNormalize3(cross(tx,ty),float3(0,0,1));
+    if(NormalWS.z<0.0) NormalWS=-NormalWS;
+}
+
+void RO_EvaluateOceanSpectrumRelativeQualityAnchored(
+    float2 RelativeXYCm,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    float4 AnchorPhase0123, float4 AnchorPhase4567, float QualityMode,
+    out float3 DisplacementCm, out float3 NormalWS, out float HorizontalJacobian)
+{
+    RO_EvaluateOceanSpectrumRelativeBandsAnchored(RelativeXYCm,SwellDirectionDegrees,WindDirectionDegrees,
+        SwellHsMeters,WindSeaHsMeters,SwellPeriodSeconds,WindSeaPeakPeriodSeconds,SwellDirectionalSpread,
+        WindSeaDirectionalSpread,Steepness,WindSeaSteepnessScale,GravityMS2,AnchorPhase0123,AnchorPhase4567,
+        RO_WaveBandCountFromQuality(QualityMode),DisplacementCm,NormalWS,HorizontalJacobian);
+}
+
+void RO_EvaluateOceanSpectrumDisplacementRelativeQualityAnchored(
+    float2 RelativeXYCm,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    float4 AnchorPhase0123, float4 AnchorPhase4567, float QualityMode,
+    out float3 DisplacementCm)
+{
+    RO_EvaluateOceanSpectrumDisplacementRelativeBandsAnchored(RelativeXYCm,SwellDirectionDegrees,WindDirectionDegrees,
+        SwellHsMeters,WindSeaHsMeters,SwellPeriodSeconds,WindSeaPeakPeriodSeconds,SwellDirectionalSpread,
+        WindSeaDirectionalSpread,Steepness,WindSeaSteepnessScale,GravityMS2,AnchorPhase0123,AnchorPhase4567,
+        RO_WaveBandCountFromQuality(QualityMode),DisplacementCm);
+}
+
+// Compatibility wrappers: preserve M24 Custom Expressions if a project has not migrated the material yet.
+// They reproduce a swell-only sea using the old argument list.
+void RO_EvaluateOceanWavesRelativeBandsAnchored(float2 XY,float Dir,float Hs,float Tp,float Spread,float Steep,float G,float4 P0,float4 P1,int Bands,out float3 D,out float3 N)
+{
+    float J;
+    RO_EvaluateOceanSpectrumRelativeBandsAnchored(XY,Dir,Dir,Hs,0.0,Tp,max(1.5,Tp*0.55),Spread,0.7,Steep,0.88,G,P0,P1,Bands,D,N,J);
+}
+void RO_EvaluateOceanDisplacementRelativeBandsAnchored(float2 XY,float Dir,float Hs,float Tp,float Spread,float Steep,float G,float4 P0,float4 P1,int Bands,out float3 D)
+{
+    RO_EvaluateOceanSpectrumDisplacementRelativeBandsAnchored(XY,Dir,Dir,Hs,0.0,Tp,max(1.5,Tp*0.55),Spread,0.7,Steep,0.88,G,P0,P1,Bands,D);
+}
+void RO_EvaluateOceanNormalRelativeBandsAnchored(float2 XY,float Dir,float Hs,float Tp,float Spread,float Steep,float G,float4 P0,float4 P1,int Bands,out float3 N)
+{
+    RO_EvaluateOceanSpectrumNormalRelativeBandsAnchored(XY,Dir,Dir,Hs,0.0,Tp,max(1.5,Tp*0.55),Spread,0.7,Steep,0.88,G,P0,P1,Bands,N);
+}
+void RO_EvaluateOceanWavesRelativeQualityAnchored(float2 XY,float Dir,float Hs,float Tp,float Spread,float Steep,float G,float4 P0,float4 P1,float Q,out float3 D,out float3 N)
+{
+    float J; RO_EvaluateOceanSpectrumRelativeQualityAnchored(XY,Dir,Dir,Hs,0.0,Tp,max(1.5,Tp*0.55),Spread,0.7,Steep,0.88,G,P0,P1,Q,D,N,J);
+}
+void RO_EvaluateOceanDisplacementRelativeQualityAnchored(float2 XY,float Dir,float Hs,float Tp,float Spread,float Steep,float G,float4 P0,float4 P1,float Q,out float3 D)
+{
+    RO_EvaluateOceanSpectrumDisplacementRelativeQualityAnchored(XY,Dir,Dir,Hs,0.0,Tp,max(1.5,Tp*0.55),Spread,0.7,Steep,0.88,G,P0,P1,Q,D);
+}
+
+
+// M36/0.33.4: view-scoped phase anchors. CameraPositionWS is a native per-view material input,
+// so split-screen and SceneCapture views no longer depend on one world-global camera anchor in the MPC.
+void RO_CalculateViewWaveAnchorsM36(
+    float2 CameraWorldXYCm,
+    float OceanTimeSeconds,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    out float4 AnchorPhase0123, out float4 AnchorPhase4567)
+{
+    const float2 cameraMeters = CameraWorldXYCm * 0.01;
+    float phases[8];
+    [unroll] for (int i = 0; i < 8; ++i)
+    {
+        float2 D; float k; float amplitude; float horizontalAmplitude; float phaseOffset;
+        RO_GetDualSpectrumBandParameters(i, SwellDirectionDegrees, WindDirectionDegrees,
+            SwellHsMeters, WindSeaHsMeters, SwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+            SwellDirectionalSpread, WindSeaDirectionalSpread, Steepness, WindSeaSteepnessScale,
+            GravityMS2, D, k, amplitude, horizontalAmplitude, phaseOffset);
+        const float omega = sqrt(max(GravityMS2, 0.01) * k);
+        float phase = fmod(k * dot(D, cameraMeters) - omega * OceanTimeSeconds, RO_TWO_PI);
+        if (phase < 0.0) phase += RO_TWO_PI;
+        phases[i] = phase;
+    }
+    AnchorPhase0123 = float4(phases[0], phases[1], phases[2], phases[3]);
+    AnchorPhase4567 = float4(phases[4], phases[5], phases[6], phases[7]);
+}
+
+void RO_CalculateViewMicroAnchorsM36(
+    float2 CameraWorldXYCm, float OceanTimeSeconds, float WindDirectionDegrees,
+    out float4 MicroAnchorPhase0123)
+{
+    const float2 cameraMeters = CameraWorldXYCm * 0.01;
+    const float4 wavelength = float4(1.20, 0.55, 0.24, 0.11);
+    const float4 dirOffset = float4(7.0, -23.0, 41.0, -57.0);
+    const float4 timeScale = float4(1.0, 1.35, 1.8, 2.35);
+    float phases[4];
+    [unroll] for (int i = 0; i < 4; ++i)
+    {
+        const float k = RO_TWO_PI / wavelength[i];
+        const float dir = radians(WindDirectionDegrees + dirOffset[i]);
+        float sd, cd; sincos(dir, sd, cd);
+        const float2 D = float2(cd, sd);
+        const float omega = sqrt(9.80665 * k) * timeScale[i];
+        float phase = fmod(k * dot(D, cameraMeters) - omega * OceanTimeSeconds, RO_TWO_PI);
+        if (phase < 0.0) phase += RO_TWO_PI;
+        phases[i] = phase;
+    }
+    MicroAnchorPhase0123 = float4(phases[0], phases[1], phases[2], phases[3]);
+}
+
+float RO_ViewCameraDynamicDepthMetersM36(
+    float3 CameraWorldPositionCm, float SeaLevelCm, float OceanTimeSeconds,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2, float QualityMode)
+{
+    float4 p0, p1;
+    RO_CalculateViewWaveAnchorsM36(CameraWorldPositionCm.xy, OceanTimeSeconds,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, p0, p1);
+
+    // Eulerian inverse at the camera XY. Relative parameter coordinates are solved around the view origin,
+    // keeping numbers bounded while matching the CPU surface-query convention closely.
+    float2 parameterRelativeCm = 0.0.xx;
+    float3 displacementCm = 0.0.xxx;
+    const int bands = 8; // Physical waterline uses the full authoritative spectrum, independent of render quality.
+    [unroll] for (int iteration = 0; iteration < 4; ++iteration)
+    {
+        float3 normalWS; float jacobian;
+        RO_EvaluateOceanSpectrumRelativeBandsAnchored(parameterRelativeCm,
+            SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+            SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+            Steepness, WindSeaSteepnessScale, GravityMS2, p0, p1, bands, displacementCm, normalWS, jacobian);
+        parameterRelativeCm = -displacementCm.xy;
+    }
+    float3 finalNormal; float finalJacobian;
+    RO_EvaluateOceanSpectrumRelativeBandsAnchored(parameterRelativeCm,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, p0, p1, bands, displacementCm, finalNormal, finalJacobian);
+    return (SeaLevelCm + displacementCm.z - CameraWorldPositionCm.z) * 0.01;
+}
+
+float RO_DielectricFresnel(float CosIncident, float IncidentIOR, float TransmittedIOR)
+{
+    const float n1=max(IncidentIOR,RO_EPSILON), n2=max(TransmittedIOR,RO_EPSILON);
+    const float ci=saturate(abs(CosIncident)); const float eta=n1/n2;
+    const float sinT2=eta*eta*max(0.0,1.0-ci*ci); if(sinT2>=1.0) return 1.0;
+    const float ct=sqrt(max(0.0,1.0-sinT2));
+    const float rs=(n1*ci-n2*ct)/max(n1*ci+n2*ct,RO_EPSILON);
+    const float rp=(n2*ci-n1*ct)/max(n2*ci+n1*ct,RO_EPSILON);
+    return saturate(0.5*(rs*rs+rp*rp));
+}
+float RO_TotalInternalReflectionMask(float CosIncident,float IncidentIOR,float TransmittedIOR)
+{
+    const float eta=max(IncidentIOR,RO_EPSILON)/max(TransmittedIOR,RO_EPSILON);
+    const float ci=saturate(abs(CosIncident)); return step(1.0,eta*eta*max(0.0,1.0-ci*ci));
+}
+float RO_CriticalAngleDegrees(float IncidentIOR,float TransmittedIOR)
+{
+    if(IncidentIOR<=TransmittedIOR) return 90.0;
+    return degrees(asin(saturate(TransmittedIOR/max(IncidentIOR,RO_EPSILON))));
+}
+
+#endif

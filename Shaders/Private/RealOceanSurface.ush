@@ -1,0 +1,806 @@
+#ifndef REALOCEAN_SURFACE_USH
+#define REALOCEAN_SURFACE_USH
+
+#include "/Plugin/RealOcean/RealOceanCommon.ush"
+#include "/Plugin/RealOcean/RealOceanWaves.ush"
+
+float RO_SurfaceDistanceFade(float2 RelativeXYCm, float FadeStartMeters, float FadeEndMeters)
+{
+    const float distanceM = length(RelativeXYCm) * 0.01;
+    const float startM = max(FadeStartMeters, 0.0);
+    const float endM = max(FadeEndMeters, startM + 1.0);
+    return 1.0 - smoothstep(startM, endM, distanceM);
+}
+
+void RO_EvaluateMicroSlopeRelativeAnchoredFilteredM32Sun(
+    float2 RelativeXYCm,
+    float WindDirectionDegrees,
+    float WindSpeedMps,
+    float MicroNormalStrength,
+    float MicroFadeStartMeters,
+    float MicroFadeEndMeters,
+    float4 MicroAnchorPhase0123,
+    float QualityMode,
+    out float2 MicroSlope,
+    out float UnresolvedSlopeVariance)
+{
+#if RO_STATIC_MICRO_WAVES_ENABLED == 0
+    MicroSlope = 0.0.xx;
+    UnresolvedSlopeVariance = 0.0;
+    return;
+#else
+    const float2 xy = RelativeXYCm * 0.01;
+    const float2 pixelDxMeters = ddx(xy);
+    const float2 pixelDyMeters = ddy(xy);
+    const float wind = saturate(max(WindSpeedMps, 0.0) / 14.0);
+    const float horizonFade = RO_SurfaceDistanceFade(RelativeXYCm, MicroFadeStartMeters, MicroFadeEndMeters);
+    const float baseStrength = max(MicroNormalStrength, 0.0) * lerp(0.20, 1.0, wind);
+    MicroSlope = 0.0.xx;
+    UnresolvedSlopeVariance = 0.0;
+    if (baseStrength <= RO_EPSILON) return;
+
+    const int bands = RO_MicroBandCountFromQuality(QualityMode);
+    const float4 wavelength = float4(1.20, 0.55, 0.24, 0.11);
+    const float4 amplitude  = float4(0.0045, 0.0026, 0.00125, 0.00055) * baseStrength;
+    const float4 dirOffset  = float4(7.0, -23.0, 41.0, -57.0);
+
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        if (i >= bands) break;
+        const float k = RO_TWO_PI / wavelength[i];
+        const float dir = radians(WindDirectionDegrees + dirOffset[i]);
+        float sDir; float cDir; sincos(dir, sDir, cDir);
+        const float2 D = float2(cDir, sDir);
+        const float phaseFootprint = max(abs(k * dot(D, pixelDxMeters)), abs(k * dot(D, pixelDyMeters)));
+        const float frequencyVisibility = 1.0 - smoothstep(0.75, 2.75, phaseFootprint);
+        const float visibility = saturate(frequencyVisibility * horizonFade);
+        const float slopeAmplitude = amplitude[i] * k;
+        const float phase = MicroAnchorPhase0123[i] + k * dot(D, xy);
+        MicroSlope += slopeAmplitude * D * cos(phase) * visibility;
+
+        // A sinusoidal slope A*k*cos(phi) has mean-square slope 0.5*(A*k)^2.
+        // Any energy removed by pixel-footprint filtering or horizon fading is not discarded:
+        // it is handed to the roughness model as unresolved slope variance. This preserves the
+        // broad sun-glitter energy while preventing sub-pixel micro normals from sparkling.
+        UnresolvedSlopeVariance += 0.5 * slopeAmplitude * slopeAmplitude * (1.0 - visibility * visibility);
+    }
+#endif
+}
+
+void RO_EvaluateMicroSlopeRelativeAnchoredFiltered(
+    float2 RelativeXYCm,
+    float WindDirectionDegrees,
+    float WindSpeedMps,
+    float MicroNormalStrength,
+    float MicroFadeStartMeters,
+    float MicroFadeEndMeters,
+    float4 MicroAnchorPhase0123,
+    float QualityMode,
+    out float2 MicroSlope)
+{
+    float unresolvedSlopeVariance;
+    RO_EvaluateMicroSlopeRelativeAnchoredFilteredM32Sun(
+        RelativeXYCm, WindDirectionDegrees, WindSpeedMps, MicroNormalStrength,
+        MicroFadeStartMeters, MicroFadeEndMeters, MicroAnchorPhase0123, QualityMode,
+        MicroSlope, unresolvedSlopeVariance);
+}
+
+// Legacy helper retained for old material snippets. M25 materials should use the filtered version above.
+void RO_EvaluateMicroSlopeRelativeAnchored(
+    float2 RelativeXYCm, float WindDirectionDegrees, float WindSpeedMps, float MicroNormalStrength,
+    float4 MicroAnchorPhase0123, float QualityMode, out float2 MicroSlope)
+{
+#if RO_STATIC_MICRO_WAVES_ENABLED == 0
+    MicroSlope = 0.0.xx;
+#else
+    const float2 xy=RelativeXYCm*0.01;
+    const float wind=saturate(max(WindSpeedMps,0.0)/14.0);
+    const float strength=max(MicroNormalStrength,0.0)*lerp(0.20,1.0,wind);
+    MicroSlope=0.0.xx;
+    const int bands=RO_MicroBandCountFromQuality(QualityMode);
+    const float4 wavelength=float4(1.20,0.55,0.24,0.11);
+    const float4 amplitude=float4(0.0045,0.0026,0.00125,0.00055)*strength;
+    const float4 dirOffset=float4(7.0,-23.0,41.0,-57.0);
+    [unroll] for(int i=0;i<4;++i){ if(i>=bands) break; const float k=RO_TWO_PI/wavelength[i]; const float dir=radians(WindDirectionDegrees+dirOffset[i]); float sd,cd; sincos(dir,sd,cd); const float2 D=float2(cd,sd); const float phase=MicroAnchorPhase0123[i]+k*dot(D,xy); MicroSlope+=amplitude[i]*k*D*cos(phase); }
+#endif
+}
+
+float3 RO_CombineMacroAndMicroNormal(float3 MacroNormalWS, float2 MicroSlope)
+{
+    const float3 macroN = RO_SafeNormalize3(MacroNormalWS, float3(0.0, 0.0, 1.0));
+    const float invZ = rcp(max(macroN.z, 0.05));
+    const float2 macroSlope = -macroN.xy * invZ;
+    const float2 combinedSlope = macroSlope + MicroSlope;
+    return RO_SafeNormalize3(float3(-combinedSlope.x, -combinedSlope.y, 1.0), float3(0.0, 0.0, 1.0));
+}
+
+// Instantaneous breaker cue from horizontal Gerstner compression + crest position + wind forcing.
+// This is not a persistent advected foam simulation; it is deliberately deterministic and asset-free.
+float RO_BreakingWaveMaskFiltered(
+    float HorizontalJacobian,
+    float3 MacroNormalWS,
+    float VerticalDisplacementCm,
+    float CombinedHsMeters,
+    float WindSpeedMps,
+    float BreakingStrength)
+{
+    const float hs=max(CombinedHsMeters,0.05);
+    const float crest=VerticalDisplacementCm*0.01/max(hs*0.5,0.025);
+    const float slope=length(MacroNormalWS.xy)/max(MacroNormalWS.z,0.08);
+    const float compression=1.0-saturate(HorizontalJacobian);
+    const float compressionAA=min(max(fwidth(compression)*0.8,0.0),0.15);
+    const float crestAA=min(max(fwidth(crest)*0.6,0.0),0.18);
+    const float compMask=smoothstep(0.12-compressionAA,0.42+compressionAA,compression);
+    const float crestMask=smoothstep(0.20-crestAA,0.72+crestAA,crest);
+    const float slopeMask=smoothstep(0.18,0.72,slope);
+    const float wind=saturate((WindSpeedMps-3.5)/11.5);
+    return saturate(compMask*crestMask*lerp(0.45,1.0,slopeMask)*lerp(0.35,1.0,wind)*max(BreakingStrength,0.0));
+}
+
+float RO_WhitecapMaskM25(
+    float BreakerMask,
+    float3 MacroNormalWS,
+    float VerticalDisplacementCm,
+    float CombinedHsMeters,
+    float WindSpeedMps,
+    float CoverageScale)
+{
+    const float hs=max(CombinedHsMeters,0.05);
+    const float crest=VerticalDisplacementCm*0.01/max(hs*0.5,0.025);
+    const float slope=length(MacroNormalWS.xy)/max(MacroNormalWS.z,0.08);
+    const float crestAA=min(max(fwidth(crest)*0.75,0.0),0.20);
+    const float background=smoothstep(0.38-crestAA,0.82+crestAA,crest)
+        * smoothstep(0.24,0.78,slope)
+        * saturate((WindSpeedMps-5.0)/10.0) * 0.45;
+    return saturate(max(BreakerMask,background)*max(CoverageScale,0.0));
+}
+
+// M35 organic foam breakup. This remains texture-free and world-space stable, but replaces the
+// visibly repetitive two-sine ribbon mask with a cheap domain-warped three-octave field. The field
+// is sampled at the advected source position, so it does not swim with the camera. Older foam raises
+// the coverage threshold and loses density, creating age-dependent thinning instead of uniform fade.
+float RO_FoamOrganicBreakupM35(
+    float2 SourceMeters,
+    float2 WindDirection,
+    float HistoryAgeSeconds,
+    float FoamDecayHalfLifeSeconds)
+{
+    const float2 wind = RO_SafeNormalize2(WindDirection, float2(1.0, 0.0));
+    const float2 crossWind = float2(-wind.y, wind.x);
+    const float halfLife = max(FoamDecayHalfLifeSeconds, 0.10);
+    const float age01 = saturate(HistoryAgeSeconds / max(halfLife * 2.0, 0.20));
+
+    // Low-frequency curl-like domain warp; two nonparallel phases keep streaks from forming a grid.
+    const float warpA = sin(dot(SourceMeters, float2(0.173, 0.287)) + dot(SourceMeters, wind) * 0.071);
+    const float warpB = cos(dot(SourceMeters, float2(-0.241, 0.119)) + dot(SourceMeters, crossWind) * 0.063 + 1.91);
+    const float2 warped = SourceMeters + float2(warpA, warpB) * 0.72;
+
+    const float octave0 = 0.5 + 0.5 * sin(dot(warped, crossWind) * 0.61 + dot(warped, wind) * 0.17);
+    const float octave1 = 0.5 + 0.5 * sin(dot(warped, crossWind) * 1.37 - dot(warped, wind) * 0.43 + 1.27);
+    const float octave2 = 0.5 + 0.5 * cos(dot(warped, float2(1.73, -2.11)) + 0.57 * octave0 + 2.03);
+    const float field = saturate(octave0 * 0.46 + octave1 * 0.34 + octave2 * 0.20);
+
+    const float threshold = lerp(0.16, 0.48, age01);
+    const float organicCoverage = smoothstep(threshold, min(threshold + 0.36, 0.96), field);
+    const float youngContinuity = lerp(0.86 + 0.14 * field, organicCoverage, age01);
+    const float ageDensity = lerp(1.0, 0.68, age01);
+    return saturate(youngContinuity * ageDensity);
+}
+
+// M27 cinematic foam memory. The surface stays asset-free and deterministic, but instead of one
+// historical sample it integrates three age slices. Each slice reconstructs the breaker source at a
+// world-locked, advected position and decays it as foam density. Wind drift and the configured mean
+// surface current both contribute to advection. Performance/Balanced still use instantaneous foam.
+float RO_HistoricalWhitecapTapCoreM35(
+    float2 RelativeXYCm,
+    float2 BreakupBaseMeters,
+    float HistoryAgeSeconds,
+    float2 AdvectionVelocityMetersPerSecond,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float CombinedHsMeters,
+    float WindSpeedMps,
+    float BreakingStrength,
+    float CoverageScale,
+    float FoamDecayHalfLifeSeconds,
+    float2 WindDirection)
+{
+    float3 historicalDisplacementCm;
+    float3 historicalNormalWS;
+    float historicalJacobian;
+
+    // Four macro bands per age tap is the M27/M35 cost ceiling. Three taps therefore add twelve
+    // historical band evaluations in Cinematic instead of turning the shader into an unbounded loop.
+    RO_EvaluateOceanSpectrumHistoricalRelativeBandsAnchored(
+        RelativeXYCm, HistoryAgeSeconds, AdvectionVelocityMetersPerSecond,
+        SwellDirectionDegrees, WindDirectionDegrees,
+        SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2,
+        AnchorPhase0123, AnchorPhase4567, 4,
+        historicalDisplacementCm, historicalNormalWS, historicalJacobian);
+
+    const float historicalBreaker = RO_BreakingWaveMaskFiltered(
+        historicalJacobian, historicalNormalWS, historicalDisplacementCm.z,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength);
+    const float historicalWhitecap = RO_WhitecapMaskM25(
+        historicalBreaker, historicalNormalWS, historicalDisplacementCm.z,
+        CombinedHsMeters, WindSpeedMps, CoverageScale);
+
+    const float halfLife = max(FoamDecayHalfLifeSeconds, 0.10);
+    const float retention = exp2(-max(HistoryAgeSeconds, 0.0) / halfLife);
+    const float2 sourceMeters = BreakupBaseMeters - AdvectionVelocityMetersPerSecond * HistoryAgeSeconds;
+    const float breakup = RO_FoamOrganicBreakupM35(
+        sourceMeters, WindDirection, HistoryAgeSeconds, FoamDecayHalfLifeSeconds);
+    return saturate(historicalWhitecap * retention * breakup);
+}
+
+// Compatibility tap: preserves the M27 call signature. Its breakup coordinate is relative, matching
+// historical behavior. The turnkey M35 path below supplies true world coordinates instead.
+float RO_HistoricalWhitecapTapM27(
+    float2 RelativeXYCm,
+    float HistoryAgeSeconds,
+    float2 AdvectionVelocityMetersPerSecond,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float CombinedHsMeters,
+    float WindSpeedMps,
+    float BreakingStrength,
+    float CoverageScale,
+    float FoamDecayHalfLifeSeconds,
+    float2 WindDirection)
+{
+    return RO_HistoricalWhitecapTapCoreM35(
+        RelativeXYCm, RelativeXYCm * 0.01, HistoryAgeSeconds, AdvectionVelocityMetersPerSecond,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength, CoverageScale,
+        FoamDecayHalfLifeSeconds, WindDirection);
+}
+
+float RO_WhitecapMaskWithAnalyticHistoryCoreM35(
+    float InstantaneousWhitecap,
+    float2 RelativeXYCm,
+    float2 BreakupBaseMeters,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float QualityMode,
+    float CombinedHsMeters,
+    float WindSpeedMps,
+    float BreakingStrength,
+    float CoverageScale,
+    float FoamMemorySeconds,
+    float FoamDecayHalfLifeSeconds,
+    float FoamWindDriftFraction,
+    float FoamSurfaceCurrentInfluence,
+    float2 SurfaceCurrentVelocityMps)
+{
+#if RO_STATIC_ANALYTIC_FOAM_HISTORY_ENABLED == 0
+    return InstantaneousWhitecap;
+#else
+    const float q = RO_ResolveQualityMode(QualityMode);
+    const float memorySeconds = clamp(FoamMemorySeconds, 0.0, 8.0);
+    if (q < 1.5 || WindSpeedMps < 4.0 || CombinedHsMeters < 0.15 || memorySeconds < 0.15)
+    {
+        return InstantaneousWhitecap;
+    }
+
+    const float windRad = radians(WindDirectionDegrees);
+    float sWind; float cWind; sincos(windRad, sWind, cWind);
+    const float2 windDirection = float2(cWind, sWind);
+
+    const float driftSpeedMps = min(max(WindSpeedMps, 0.0) * max(FoamWindDriftFraction, 0.0), 1.25);
+    float2 advectionVelocity = windDirection * driftSpeedMps
+        + SurfaceCurrentVelocityMps * max(FoamSurfaceCurrentInfluence, 0.0);
+
+    const float advectionSpeed = length(advectionVelocity);
+    if (advectionSpeed > 3.0)
+    {
+        advectionVelocity *= 3.0 / advectionSpeed;
+    }
+
+    const float age0 = memorySeconds * 0.32;
+    const float age1 = memorySeconds * 0.64;
+    const float age2 = memorySeconds;
+
+    const float retained0 = RO_HistoricalWhitecapTapCoreM35(
+        RelativeXYCm, BreakupBaseMeters, age0, advectionVelocity,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength, CoverageScale,
+        FoamDecayHalfLifeSeconds, windDirection);
+
+    const float retained1 = RO_HistoricalWhitecapTapCoreM35(
+        RelativeXYCm, BreakupBaseMeters, age1, advectionVelocity,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength, CoverageScale,
+        FoamDecayHalfLifeSeconds, windDirection);
+
+    const float retained2 = RO_HistoricalWhitecapTapCoreM35(
+        RelativeXYCm, BreakupBaseMeters, age2, advectionVelocity,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength, CoverageScale,
+        FoamDecayHalfLifeSeconds, windDirection);
+
+    float foam = saturate(InstantaneousWhitecap);
+    foam = 1.0 - (1.0 - foam) * (1.0 - retained0);
+    foam = 1.0 - (1.0 - foam) * (1.0 - retained1);
+    foam = 1.0 - (1.0 - foam) * (1.0 - retained2);
+    return saturate(foam);
+#endif
+}
+
+float RO_WhitecapMaskWithAnalyticHistoryM27(
+    float InstantaneousWhitecap,
+    float2 RelativeXYCm,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float QualityMode,
+    float CombinedHsMeters,
+    float WindSpeedMps,
+    float BreakingStrength,
+    float CoverageScale,
+    float FoamMemorySeconds,
+    float FoamDecayHalfLifeSeconds,
+    float FoamWindDriftFraction,
+    float FoamSurfaceCurrentInfluence,
+    float2 SurfaceCurrentVelocityMps)
+{
+    return RO_WhitecapMaskWithAnalyticHistoryCoreM35(
+        InstantaneousWhitecap, RelativeXYCm, RelativeXYCm * 0.01,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, QualityMode,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength, CoverageScale, FoamMemorySeconds,
+        FoamDecayHalfLifeSeconds, FoamWindDriftFraction, FoamSurfaceCurrentInfluence,
+        SurfaceCurrentVelocityMps);
+}
+
+// 0.33.5 turnkey path: the breakup field is anchored in true world meters, while the wave solve
+// remains camera-relative/LWC-safe through bounded phase anchors.
+float RO_WhitecapMaskWithAnalyticHistoryM35(
+    float InstantaneousWhitecap,
+    float2 RelativeXYCm,
+    float2 CameraWorldXYCm,
+    float SwellDirectionDegrees,
+    float WindDirectionDegrees,
+    float SwellHsMeters,
+    float WindSeaHsMeters,
+    float SwellPeriodSeconds,
+    float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread,
+    float WindSeaDirectionalSpread,
+    float Steepness,
+    float WindSeaSteepnessScale,
+    float GravityMS2,
+    float4 AnchorPhase0123,
+    float4 AnchorPhase4567,
+    float QualityMode,
+    float CombinedHsMeters,
+    float WindSpeedMps,
+    float BreakingStrength,
+    float CoverageScale,
+    float FoamMemorySeconds,
+    float FoamDecayHalfLifeSeconds,
+    float FoamWindDriftFraction,
+    float FoamSurfaceCurrentInfluence,
+    float2 SurfaceCurrentVelocityMps)
+{
+    const float2 worldXYMeters = (CameraWorldXYCm + RelativeXYCm) * 0.01;
+    return RO_WhitecapMaskWithAnalyticHistoryCoreM35(
+        InstantaneousWhitecap, RelativeXYCm, worldXYMeters,
+        SwellDirectionDegrees, WindDirectionDegrees, SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds, SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2, AnchorPhase0123, AnchorPhase4567, QualityMode,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength, CoverageScale, FoamMemorySeconds,
+        FoamDecayHalfLifeSeconds, FoamWindDriftFraction, FoamSurfaceCurrentInfluence,
+        SurfaceCurrentVelocityMps);
+}
+
+// Source compatibility for projects that still call the M26 helper directly. It reproduces the old
+// fixed defaults but forwards to the M27 implementation. New material snippets should use M27.
+float RO_WhitecapMaskWithAnalyticHistoryM26(
+    float InstantaneousWhitecap, float2 RelativeXYCm,
+    float SwellDirectionDegrees, float WindDirectionDegrees,
+    float SwellHsMeters, float WindSeaHsMeters,
+    float SwellPeriodSeconds, float WindSeaPeakPeriodSeconds,
+    float SwellDirectionalSpread, float WindSeaDirectionalSpread,
+    float Steepness, float WindSeaSteepnessScale, float GravityMS2,
+    float4 AnchorPhase0123, float4 AnchorPhase4567, float QualityMode,
+    float CombinedHsMeters, float WindSpeedMps, float BreakingStrength, float CoverageScale)
+{
+    return RO_WhitecapMaskWithAnalyticHistoryM27(
+        InstantaneousWhitecap, RelativeXYCm,
+        SwellDirectionDegrees, WindDirectionDegrees,
+        SwellHsMeters, WindSeaHsMeters,
+        SwellPeriodSeconds, WindSeaPeakPeriodSeconds,
+        SwellDirectionalSpread, WindSeaDirectionalSpread,
+        Steepness, WindSeaSteepnessScale, GravityMS2,
+        AnchorPhase0123, AnchorPhase4567, QualityMode,
+        CombinedHsMeters, WindSpeedMps, BreakingStrength, CoverageScale,
+        2.4, 1.8, 0.03, 0.0, float2(0.0, 0.0));
+}
+
+// M28 material-side bridge for the stateful GPU clipmap. The texture sample itself stays in the
+// material graph so projects can bind the plugin-owned UTextureRenderTarget2D through a normal
+// Texture2D parameter. RelativeXYCm and CenterOffsetMeters are both camera-relative/LWC-safe.
+float2 RO_FoamClipmapUVM28(float2 RelativeXYCm, float2 CenterOffsetMeters, float CoverageMeters)
+{
+    const float coverage = max(CoverageMeters, 1.0);
+    return 0.5.xx + (RelativeXYCm * 0.01 - CenterOffsetMeters) / coverage;
+}
+
+// M36 per-view sampling of the one world-space persistent foam field. SceneCapture/split-screen
+// views share the same physical texture; views outside its coverage naturally fall back to analytic foam.
+float2 RO_FoamClipmapUVWorldM36(float2 WorldXYMeters, float2 CenterWorldXYMeters, float CoverageMeters)
+{
+    const float coverage = max(CoverageMeters, 1.0);
+    return 0.5.xx + (WorldXYMeters - CenterWorldXYMeters) / coverage;
+}
+
+float RO_CombineStatefulFoamM28(float AnalyticFoam, float StatefulDensity, float ClipmapValid, float Blend)
+{
+    const float stateful = saturate(StatefulDensity) * saturate(ClipmapValid) * saturate(Blend);
+    return saturate(1.0 - (1.0 - saturate(AnalyticFoam)) * (1.0 - stateful));
+}
+
+// M29 edge hiding: the persistent square fades into the deterministic M27 analytic result before
+// reaching the clipmap border. Outside [0,1] the stateful contribution is exactly zero, so a clamp
+// sampler can never smear the last valid texel into an obvious camera-centered square.
+float RO_FoamClipmapEdgeWeightM29(float2 ClipmapUV, float CoverageMeters, float EdgeFadeMeters)
+{
+    if (any(ClipmapUV <= 0.0.xx) || any(ClipmapUV >= 1.0.xx))
+    {
+        return 0.0;
+    }
+
+    const float coverage = max(CoverageMeters, 1.0);
+    const float2 edgeUV = min(ClipmapUV, 1.0.xx - ClipmapUV);
+    const float edgeDistanceMeters = min(edgeUV.x, edgeUV.y) * coverage;
+    const float fadeMeters = max(EdgeFadeMeters, 0.001);
+    return smoothstep(0.0, fadeMeters, edgeDistanceMeters);
+}
+
+float RO_CombineStatefulFoamM29(
+    float AnalyticFoam,
+    float StatefulDensity,
+    float ClipmapValid,
+    float Blend,
+    float2 ClipmapUV,
+    float CoverageMeters,
+    float EdgeFadeMeters)
+{
+    const float edgeWeight = RO_FoamClipmapEdgeWeightM29(ClipmapUV, CoverageMeters, EdgeFadeMeters);
+    const float stateful = saturate(StatefulDensity) * saturate(ClipmapValid) * saturate(Blend) * edgeWeight;
+    return saturate(1.0 - (1.0 - saturate(AnalyticFoam)) * (1.0 - stateful));
+}
+
+float RO_SurfaceNormalVarianceM32Sun(float3 NormalWS)
+{
+    const float3 n = RO_SafeNormalize3(NormalWS, float3(0.0, 0.0, 1.0));
+    const float3 dxN = ddx(n);
+    const float3 dyN = ddy(n);
+    return max(0.0, 0.5 * (dot(dxN, dxN) + dot(dyN, dyN)));
+}
+
+float RO_SurfaceRoughnessM32Sun(
+    float BaseRoughness,
+    float WindSpeedMps,
+    float WhitecapMask,
+    float2 RelativeXYCm,
+    float MicroFadeStartMeters,
+    float MicroFadeEndMeters,
+    float HorizonRoughnessBoost,
+    float UnresolvedMicroSlopeVariance,
+    float3 CombinedNormalWS)
+{
+    const float windRoughness = saturate(WindSpeedMps / 20.0) * 0.055;
+    const float baseWaterRoughness = saturate(max(BaseRoughness, 0.0) + windRoughness);
+
+    // Convert only the actually filtered micro-slope energy into aggregate roughness. This replaces
+    // the old fixed far-distance roughness ramp that could over-blur the solar glitter path.
+    const float energyRoughness = sqrt(max(
+        baseWaterRoughness * baseWaterRoughness + max(UnresolvedMicroSlopeVariance, 0.0), 0.0));
+    const float energyDelta = max(energyRoughness - baseWaterRoughness, 0.0);
+    const float microFade = RO_SurfaceDistanceFade(RelativeXYCm, MicroFadeStartMeters, MicroFadeEndMeters);
+    const float stabilityFloor = (1.0 - microFade) * max(HorizonRoughnessBoost, 0.0) * 0.35;
+    const float unresolvedComp = min(max(energyDelta, stabilityFloor), max(HorizonRoughnessBoost, 0.0));
+    float waterRoughness = saturate(baseWaterRoughness + unresolvedComp);
+
+    // Screen-space specular AA: broaden only as much as the resolved normal footprint requires.
+    // This specifically targets one-pixel sun sparkles under TSR/TAA without globally dulling the sea.
+    const float normalVariance = RO_SurfaceNormalVarianceM32Sun(CombinedNormalWS);
+    const float aaVariance = min(normalVariance * 0.35, 0.030);
+    waterRoughness = sqrt(saturate(waterRoughness * waterRoughness + aaVariance));
+
+    // Foam remains optically rough and therefore naturally suppresses the direct-sun glitter.
+    return saturate(waterRoughness + saturate(WhitecapMask) * 0.48);
+}
+
+float RO_SurfaceRoughnessM25(
+    float BaseRoughness,
+    float WindSpeedMps,
+    float WhitecapMask,
+    float2 RelativeXYCm,
+    float MicroFadeStartMeters,
+    float MicroFadeEndMeters,
+    float HorizonRoughnessBoost)
+{
+    const float windRoughness=saturate(WindSpeedMps/20.0)*0.055;
+    const float microFade=RO_SurfaceDistanceFade(RelativeXYCm,MicroFadeStartMeters,MicroFadeEndMeters);
+    const float horizonComp=(1.0-microFade)*max(HorizonRoughnessBoost,0.0);
+    return saturate(max(BaseRoughness,0.0)+windRoughness+WhitecapMask*0.48+horizonComp);
+}
+
+
+// M32Sun sun-reflection diagnostic/assist. It does not replace SingleLayerWater's BRDF; instead it
+// exposes where the local resolved normal can reflect the finite solar disk toward the camera.
+// Projects can use this as a debug mask or a very small artistic assist without changing the
+// physically-driven normal/roughness path above.
+float RO_SunGlitterMaskM32Sun(
+    float3 SurfaceNormalWS,
+    float3 CameraVectorWS,
+    float3 SunDirectionToSourceWS,
+    float SurfaceRoughness,
+    float AirIOR,
+    float WaterIOR,
+    float SunRelativeIntensity,
+    out float FresnelOut,
+    out float AngularErrorDegreesOut)
+{
+    const float3 N = RO_SafeNormalize3(SurfaceNormalWS, float3(0.0, 0.0, 1.0));
+    const float3 V = RO_SafeNormalize3(CameraVectorWS, float3(0.0, 0.0, 1.0));
+    const float3 L = RO_SafeNormalize3(SunDirectionToSourceWS, float3(0.0, 0.0, 1.0));
+    FresnelOut = 0.0;
+    AngularErrorDegreesOut = 180.0;
+
+    const float NoV = dot(N, V);
+    const float NoL = dot(N, L);
+    if (L.z <= 0.0 || NoV <= 0.0 || NoL <= 0.0 || SunRelativeIntensity <= 0.0)
+    {
+        return 0.0;
+    }
+
+    const float3 H = RO_SafeNormalize3(V + L, N);
+    const float NoH = saturate(dot(N, H));
+    const float VoH = saturate(dot(V, H));
+    // 2*(1-cos(theta)) is a stable small-angle approximation of theta^2 and avoids acos
+    // instability in the hottest part of the solar highlight.
+    const float angularErrorSquared = max(2.0 * (1.0 - NoH), 0.0);
+    AngularErrorDegreesOut = degrees(sqrt(angularErrorSquared));
+
+    // Sun angular radius is ~0.266 degrees. A reflected ray rotates about twice as fast as the
+    // microfacet normal, so the corresponding normal-space disk radius is approximately half.
+    const float solarNormalRadius = radians(0.266) * 0.5;
+    const float roughnessWidth = max(SurfaceRoughness * SurfaceRoughness * 0.45, radians(0.02));
+    const float normalFootprint = sqrt(max(RO_SurfaceNormalVarianceM32Sun(N), 0.0));
+    const float effectiveWidth = max(solarNormalRadius + roughnessWidth + 0.35 * normalFootprint, radians(0.02));
+    const float widthSquared = effectiveWidth * effectiveWidth;
+
+    // Gaussian-like visibility around the exact reflection normal. The derivative contribution in
+    // effectiveWidth turns isolated one-pixel flashes into an energy-preserving small lobe.
+    const float glitter = exp2(-0.72134752 * angularErrorSquared / max(widthSquared, 1.0e-8));
+    FresnelOut = RO_DielectricFresnel(VoH, max(AirIOR, 1.0), max(WaterIOR, 1.0));
+
+    // Keep the result as a visibility/debug mask; Fresnel is returned separately so the material
+    // author cannot accidentally bake an arbitrary extra reflection energy into the core roughness.
+    const float sunVisibility = saturate(SunRelativeIntensity);
+    return saturate(glitter * sunVisibility);
+}
+
+// 0.33.5 Cinematic-only, deliberately low-energy finite-sun assist. SingleLayerWater remains the
+// primary BRDF and this term is capped to avoid double-counting a second full specular lobe. It is
+// most visible at low sun/grazing angles where a finite solar disk helps preserve a coherent open-
+// ocean glitter path after temporal filtering.
+float3 RO_SunGlitterAssistM35(
+    float3 SurfaceNormalWS,
+    float3 CameraVectorWS,
+    float3 SunDirectionToSourceWS,
+    float3 SunColor,
+    float SurfaceRoughness,
+    float AirIOR,
+    float WaterIOR,
+    float SunRelativeIntensity,
+    float QualityMode)
+{
+    if (RO_ResolveQualityMode(QualityMode) < 1.5 || SunRelativeIntensity <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    float fresnel;
+    float angularErrorDegrees;
+    const float mask = RO_SunGlitterMaskM32Sun(
+        SurfaceNormalWS, CameraVectorWS, SunDirectionToSourceWS,
+        SurfaceRoughness, AirIOR, WaterIOR, 1.0,
+        fresnel, angularErrorDegrees);
+
+    const float3 L = RO_SafeNormalize3(SunDirectionToSourceWS, float3(0.0, 0.0, 1.0));
+    const float lowSun = pow(saturate(1.0 - L.z), 0.75);
+    const float assistScale = lerp(0.0045, 0.018, lowSun);
+    const float boundedEnergy = min(mask * fresnel * assistScale * max(SunRelativeIntensity, 0.0), 0.025);
+    return max(SunColor, 0.0.xxx) * boundedEnergy;
+}
+
+
+// 0.32.4 underwater sun-window model. The local facet refracts the finite solar disk into
+// Snell's window, while unresolved roughness/derivatives broaden the lobe with area compensation
+// so anti-aliasing cannot create extra solar energy. A short near-surface ramp prevents a hard
+// one-frame pop when the camera crosses a moving wave crest.
+float3 RO_UnderwaterSunWindowM33UW(
+    float3 SurfaceNormalWS,
+    float3 ViewDirectionWS,
+    float3 SunDirectionToSourceWS,
+    float3 SunColor,
+    float SurfaceRoughness,
+    float AirIOR,
+    float WaterIOR,
+    float CameraDepthMeters,
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float SunRelativeIntensity,
+    out float VisibilityOut,
+    out float InterfaceTransmissionOut,
+    out float AngularErrorDegreesOut)
+{
+    const float3 N = RO_SafeNormalize3(SurfaceNormalWS, float3(0.0, 0.0, 1.0));
+    const float3 Vdown = RO_SafeNormalize3(ViewDirectionWS, float3(0.0, 0.0, -1.0));
+    const float3 Lair = RO_SafeNormalize3(SunDirectionToSourceWS, float3(0.0, 0.0, 1.0));
+    VisibilityOut = 0.0;
+    InterfaceTransmissionOut = 0.0;
+    AngularErrorDegreesOut = 180.0;
+
+    // The node is intentionally underside-only. ViewDirectionWS points from surface to camera.
+    if (Lair.z <= 0.0 || dot(N, Vdown) >= 0.0 || SunRelativeIntensity <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    float interfaceTransmission;
+    float transmittedDownCos;
+    const float3 Tdown = RO_RefractSunIntoWaterLocal(
+        Lair, N, AirIOR, WaterIOR, interfaceTransmission, transmittedDownCos);
+    if (dot(Tdown, Tdown) <= 1.0e-8 || interfaceTransmission <= 0.0)
+    {
+        return 0.0.xxx;
+    }
+
+    const float alignment = saturate(dot(Tdown, Vdown));
+    const float angularErrorSquared = max(2.0 * (1.0 - alignment), 0.0);
+    AngularErrorDegreesOut = degrees(sqrt(angularErrorSquared));
+
+    const float noLair = saturate(dot(N, Lair));
+    const float cosWaterLocal = max(-dot(Tdown, N), 0.02);
+    // d(theta_water)/d(theta_air) from Snell's law. At grazing incidence the solar disk is
+    // compressed inside Snell's window instead of keeping its air-space angular radius.
+    const float eta = max(AirIOR, RO_EPSILON) / max(WaterIOR, RO_EPSILON);
+    const float snellAngularScale = clamp(eta * noLair / cosWaterLocal, 0.08, 1.0);
+    const float solarRadiusWater = max(radians(0.266) * snellAngularScale, radians(0.01));
+
+    // SurfaceRoughness is unresolved microfacet width. Normal derivatives and alignment derivatives
+    // are pixel-integration widths, not extra light sources. Combine variances, then scale the peak
+    // by referenceArea/effectiveArea so broadening preserves integrated solar energy.
+    const float roughnessWidth = max(saturate(SurfaceRoughness) * saturate(SurfaceRoughness) * 0.40, 0.0);
+    const float normalFootprint = sqrt(max(RO_SurfaceNormalVarianceM32Sun(N), 0.0));
+    const float alignmentDelta = min(abs(ddx(alignment)) + abs(ddy(alignment)), 0.08);
+    const float alignmentFootprint = sqrt(max(2.0 * alignmentDelta, 0.0));
+
+    const float referenceWidth2 = max(solarRadiusWater * solarRadiusWater, 1.0e-8);
+    const float effectiveWidth2 = max(
+        referenceWidth2
+        + roughnessWidth * roughnessWidth
+        + 0.09 * normalFootprint * normalFootprint
+        + 0.16 * alignmentFootprint * alignmentFootprint,
+        1.0e-8);
+    const float lobeEnergyCompensation = saturate(referenceWidth2 / effectiveWidth2);
+    const float lobe = exp2(-0.72134752 * angularErrorSquared / effectiveWidth2);
+
+    InterfaceTransmissionOut = interfaceTransmission;
+    // A very short physical-depth fade hides the binary two-sided/material-branch crossing without
+    // replacing the subsystem's configurable post-process UnderwaterBlend transition.
+    const float waterlineWeight = smoothstep(0.015, 0.22, max(CameraDepthMeters, 0.0));
+    const float visibility = saturate(lobe * lobeEnergyCompensation * waterlineWeight);
+    VisibilityOut = visibility;
+
+    // CameraDepthMeters is vertical depth. Use the actual camera ray for extinction so wave-normal
+    // motion cannot independently pump disk brightness. Near-horizontal rays are naturally dimmed
+    // by their longer water path.
+    const float viewVerticalCos = max(-Vdown.z, 0.04);
+    const float pathMeters = max(CameraDepthMeters, 0.0) / viewVerticalCos;
+    const float3 extinction = max(AbsorptionPerMeter + ScatteringPerMeter, 0.0.xxx);
+    const float3 waterTransmission = RO_ExpNeg3(extinction * pathMeters);
+
+    return max(SunColor, 0.0.xxx)
+        * max(SunRelativeIntensity, 0.0)
+        * interfaceTransmission
+        * waterTransmission
+        * visibility;
+}
+
+// Source-compatible 0.32.3 name for projects that copied the previous Custom node body.
+float3 RO_UnderwaterSunWindowM32UW(
+    float3 SurfaceNormalWS,
+    float3 ViewDirectionWS,
+    float3 SunDirectionToSourceWS,
+    float3 SunColor,
+    float SurfaceRoughness,
+    float AirIOR,
+    float WaterIOR,
+    float CameraDepthMeters,
+    float3 AbsorptionPerMeter,
+    float3 ScatteringPerMeter,
+    float SunRelativeIntensity,
+    out float VisibilityOut,
+    out float InterfaceTransmissionOut,
+    out float AngularErrorDegreesOut)
+{
+    return RO_UnderwaterSunWindowM33UW(
+        SurfaceNormalWS, ViewDirectionWS, SunDirectionToSourceWS, SunColor,
+        SurfaceRoughness, AirIOR, WaterIOR, CameraDepthMeters,
+        AbsorptionPerMeter, ScatteringPerMeter, SunRelativeIntensity,
+        VisibilityOut, InterfaceTransmissionOut, AngularErrorDegreesOut);
+}
+
+// M24 compatibility aliases.
+float RO_WhitecapMaskFiltered(float3 N,float Z,float Hs,float Wind,float Steep)
+{
+    return RO_WhitecapMaskM25(0.0,N,Z,Hs,Wind,1.0)*lerp(0.7,1.0,saturate(Steep));
+}
+float RO_SurfaceRoughnessFromWindAndFoam(float Base,float Wind,float Foam)
+{
+    return saturate(max(Base,0.0)+saturate(Wind/20.0)*0.055+Foam*0.48);
+}
+
+#endif

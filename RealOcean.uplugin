@@ -1,0 +1,22 @@
+{
+  "FileVersion": 3,
+  "Version": 44,
+  "VersionName": "0.33.5",
+  "FriendlyName": "Real Ocean",
+  "Description": "Turnkey physically coherent ocean rendering and runtime-query plugin with dual-spectrum waves, world-space foam, caustics, underwater optics, day-cycle lighting, multiplayer clock synchronization, and per-view rendering support, turbidity-driven optics, cinematic finite-sun glitter, and organic foam breakup.",
+  "Category": "Rendering",
+  "CreatedBy": "RealOcean Project",
+  "EngineVersion": "5.8.2",
+  "CanContainContent": false,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "EnabledByDefault": true,
+  "Modules": [
+    {"Name": "RealOcean", "Type": "Runtime", "LoadingPhase": "PostConfigInit"},
+    {"Name": "RealOceanEditor", "Type": "Editor", "LoadingPhase": "PostEngineInit"}
+  ],
+  "Plugins": [
+    {"Name": "Water", "Enabled": true}
+  ]
+}
